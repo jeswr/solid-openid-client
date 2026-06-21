@@ -308,6 +308,12 @@ export async function createSolidOidcClient(
   // The DPoP-attaching authed fetch. Builds the resource-request proof via @jeswr/solid-dpop
   // (with `ath` bound to the current access token) and retries once on a server `DPoP-Nonce`
   // challenge (RFC 9449 §8). Throws if called before any token is available.
+  //
+  // It handles a `Request` input AND an `init` faithfully: the effective method/headers/body are
+  // resolved from BOTH (an explicit `init` field overrides the `Request`'s), so a `POST`/`PUT`
+  // `Request` passed with no `init` keeps its method + body (a bug fixed per a roborev finding).
+  // The body is BUFFERED once up front (to a string/ArrayBuffer) so the §8 nonce retry can replay
+  // it — a non-replayable stream body would otherwise be consumed by the first attempt.
   const authedFetch: FetchLike = async (input, init) => {
     if (currentTokens === undefined) {
       throw new Error(
@@ -315,19 +321,57 @@ export async function createSolidOidcClient(
       );
     }
     const accessToken = currentTokens.accessToken;
-    const url = input instanceof Request ? input.url : input.toString();
-    const method = (
-      init?.method ?? (input instanceof Request ? input.method : "GET")
-    ).toUpperCase();
+    const reqInput = input instanceof Request ? input : undefined;
+    const url = reqInput ? reqInput.url : input.toString();
+
+    // Effective method: explicit init wins, else the Request's, else GET.
+    const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
+
+    // Effective base RequestInit, carrying over the Request's transport fields when init omits
+    // them, so nothing (mode/credentials/redirect/signal/…) is silently dropped.
+    const baseInit: RequestInit = {
+      ...(reqInput
+        ? {
+            method: reqInput.method,
+            redirect: reqInput.redirect,
+            ...(reqInput.signal ? { signal: reqInput.signal } : {}),
+          }
+        : {}),
+      ...(init ?? {}),
+      method,
+    };
+
+    // Buffer the body ONCE so it is replayable across the original + nonce-retry attempts.
+    // Precedence matches `fetch`: an explicit `init.body` wins over the Request's body.
+    let bufferedBody: BodyInit | undefined;
+    if (init && "body" in init) {
+      bufferedBody = (init.body ?? undefined) as BodyInit | undefined;
+    } else if (reqInput && reqInput.body !== null) {
+      // A Request body is a stream; read it to an ArrayBuffer so we can send it more than once.
+      bufferedBody = await reqInput.clone().arrayBuffer();
+    }
+
+    // Merge headers from the Request then the init (init overrides), so a Request's content-type
+    // etc. is preserved while an explicit init header still wins.
+    const buildHeaders = (proof: string): Headers => {
+      const headers = new Headers(reqInput?.headers ?? undefined);
+      if (init?.headers) {
+        new Headers(init.headers).forEach((v, k) => {
+          headers.set(k, v);
+        });
+      }
+      headers.set("authorization", `DPoP ${accessToken}`);
+      headers.set("dpop", proof);
+      return headers;
+    };
 
     const doFetch = async (nonce?: string): Promise<Response> => {
       const proof = await resourceDpopProof(dpopKeyPair, method, url, accessToken, nonce);
-      const headers = new Headers(
-        init?.headers ?? (input instanceof Request ? input.headers : undefined),
-      );
-      headers.set("authorization", `DPoP ${accessToken}`);
-      headers.set("dpop", proof);
-      const req: RequestInit = init ? { ...init, headers } : { headers };
+      const req: RequestInit = {
+        ...baseInit,
+        headers: buildHeaders(proof),
+        ...(bufferedBody !== undefined ? { body: bufferedBody } : {}),
+      };
       return userFetch(url, req);
     };
 

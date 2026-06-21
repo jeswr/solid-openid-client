@@ -153,9 +153,9 @@ describe("handleCallback — happy path", () => {
     // Verify the ID token against the OP's REAL public key — proving the engine accepted a
     // properly-signed token and our test is not vacuous.
     const claims = await verifyWithOpKey(session.tokens.idToken as string, op.opPublicJwk);
-    expect(claims["iss"]).toBe(ISSUER);
-    expect(claims["aud"]).toBe(CLIENT_ID);
-    expect(claims["webid"]).toBe(WEBID);
+    expect(claims.iss).toBe(ISSUER);
+    expect(claims.aud).toBe(CLIENT_ID);
+    expect(claims.webid).toBe(WEBID);
   });
 
   it("sent a DPoP proof to the token endpoint (sender-constrained exchange)", async () => {
@@ -413,6 +413,61 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     // the retried proof carried the server nonce
     const proof = op.lastResourceDpop();
     expect(proof?.payload.nonce).toBe("server-nonce-xyz");
+  });
+
+  // Regression (roborev Medium): a Request input with NO init must keep its method + body.
+  it("preserves the method AND body of a Request input passed with no init", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    const req = new Request("https://op.example/resource/doc.ttl", {
+      method: "PUT",
+      body: "the-body-bytes",
+      headers: { "content-type": "text/turtle" },
+    });
+    await client.fetch(req);
+    // the DPoP proof htm reflects PUT
+    expect(op.lastResourceDpop()?.payload.htm).toBe("PUT");
+    // the request that actually reached the RS carried PUT + the body + the content-type
+    const sent = op.captured.find((r) => r.url.includes("/resource/"));
+    expect(sent?.method).toBe("PUT");
+    expect(sent?.body).toBe("the-body-bytes");
+    expect(sent?.headers["content-type"]).toBe("text/turtle");
+    expect(sent?.headers.authorization).toMatch(/^DPoP /);
+  });
+
+  // Regression (roborev Medium): the nonce retry must REPLAY the body (not consume-then-drop it).
+  it("replays the request body on the §8 nonce retry", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    op.challengeNextResourceWithNonce("nonce-1");
+    const req = new Request("https://op.example/resource/doc.ttl", {
+      method: "POST",
+      body: "replayable-payload",
+    });
+    const res = await client.fetch(req);
+    expect(res.status).toBe(200);
+    // BOTH the original (401) and the retry carried the SAME body.
+    const resourceReqs = op.captured.filter((r) => r.url.includes("/resource/"));
+    expect(resourceReqs.length).toBe(2);
+    expect(resourceReqs[0]?.body).toBe("replayable-payload");
+    expect(resourceReqs[1]?.body).toBe("replayable-payload");
+    // and the retry's proof carried the server nonce
+    expect(op.lastResourceDpop()?.payload.nonce).toBe("nonce-1");
+  });
+
+  // An explicit init.body overrides a Request body (fetch precedence).
+  it("lets an explicit init override a Request's method/body", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    const req = new Request("https://op.example/resource/doc.ttl", {
+      method: "POST",
+      body: "request-body",
+    });
+    await client.fetch(req, { method: "PATCH", body: "init-body" });
+    const sent = op.captured.find((r) => r.url.includes("/resource/"));
+    expect(sent?.method).toBe("PATCH");
+    expect(sent?.body).toBe("init-body");
+    expect(op.lastResourceDpop()?.payload.htm).toBe("PATCH");
   });
 
   it("THROWS if called before any token is available", async () => {

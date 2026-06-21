@@ -216,16 +216,42 @@ async function createSolidOidcClient(opts) {
       );
     }
     const accessToken = currentTokens.accessToken;
-    const url = input instanceof Request ? input.url : input.toString();
-    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-    const doFetch = async (nonce) => {
-      const proof = await resourceDpopProof(dpopKeyPair, method, url, accessToken, nonce);
-      const headers = new Headers(
-        init?.headers ?? (input instanceof Request ? input.headers : void 0)
-      );
+    const reqInput = input instanceof Request ? input : void 0;
+    const url = reqInput ? reqInput.url : input.toString();
+    const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
+    const baseInit = {
+      ...reqInput ? {
+        method: reqInput.method,
+        redirect: reqInput.redirect,
+        ...reqInput.signal ? { signal: reqInput.signal } : {}
+      } : {},
+      ...init ?? {},
+      method
+    };
+    let bufferedBody;
+    if (init && "body" in init) {
+      bufferedBody = init.body ?? void 0;
+    } else if (reqInput && reqInput.body !== null) {
+      bufferedBody = await reqInput.clone().arrayBuffer();
+    }
+    const buildHeaders = (proof) => {
+      const headers = new Headers(reqInput?.headers ?? void 0);
+      if (init?.headers) {
+        new Headers(init.headers).forEach((v, k) => {
+          headers.set(k, v);
+        });
+      }
       headers.set("authorization", `DPoP ${accessToken}`);
       headers.set("dpop", proof);
-      const req = init ? { ...init, headers } : { headers };
+      return headers;
+    };
+    const doFetch = async (nonce) => {
+      const proof = await resourceDpopProof(dpopKeyPair, method, url, accessToken, nonce);
+      const req = {
+        ...baseInit,
+        headers: buildHeaders(proof),
+        ...bufferedBody !== void 0 ? { body: bufferedBody } : {}
+      };
       return userFetch(url, req);
     };
     const res = await doFetch();
