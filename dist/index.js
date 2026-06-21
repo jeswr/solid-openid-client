@@ -162,7 +162,7 @@ function assertSecureTransport(rawUrl, allowInsecure, makeError) {
 function assertIssuerTransport2(issuer, allowInsecure) {
   assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
 }
-function assertRedirectUri(redirectUri, allowInsecure) {
+function assertRedirectUri(redirectUri) {
   let u;
   try {
     u = new URL(redirectUri);
@@ -171,11 +171,16 @@ function assertRedirectUri(redirectUri, allowInsecure) {
       `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`
     );
   }
-  assertSecureTransport(
-    redirectUri,
-    allowInsecure,
-    (msg) => new Error(`createSolidOidcClient: \`redirectUri\` ${msg}`)
-  );
+  if (u.protocol === "http:" && !isLoopbackHost2(u.hostname)) {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` must be https for a non-loopback host (${redirectUri}). http: is permitted only for a loopback redirect URI (the RFC 8252 native-app pattern).`
+    );
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` has an unsupported scheme (${redirectUri}); expected https:.`
+    );
+  }
   if (u.search !== "" || u.hash !== "") {
     throw new Error(
       `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). openid-client derives the token-endpoint redirect_uri from the callback origin+path (query stripped), so a query here would mismatch and the OP would reject the code exchange. Carry per-flow data in \`state\` / \`authorizationUrl(extraParams)\` instead.`
@@ -249,7 +254,7 @@ async function createSolidOidcClient(opts) {
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
-  assertRedirectUri(redirectUri, allowInsecure);
+  assertRedirectUri(redirectUri);
   const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   const userFetch = opts.fetch ?? globalThis.fetch;
   const dpopKeyPair = opts.dpopKeyPair ?? await generateDpopKeyPair();

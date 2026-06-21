@@ -145,9 +145,14 @@ These are this package's choices (the maintainer can steer them — see the open
 
 6. **Asymmetric DPoP, PKCE always, state + nonce always, no token logging, TLS everywhere.** PKCE
    (S256), a random `state` (CSRF), and a random `nonce` (ID-token binding) are generated and
-   validated on **every** flow regardless of OP metadata. `http:` issuers **and** `http:` resource
-   URLs (the authed `fetch` never sends the DPoP token over plaintext) are rejected unless
-   `allowInsecure` is set for a loopback host. Tokens are never logged.
+   validated on **every** flow regardless of OP metadata; the authorization code is DPoP-bound via
+   `dpop_jkt` (RFC 9449 §10). The `issuer`, every **discovered endpoint**, and every `http:`
+   resource URL the authed `fetch` hits are rejected unless https — `http:` is permitted only for a
+   loopback host with `allowInsecure` (for a local dev OP). A **loopback `http:` redirect URI**
+   (the RFC 8252 native-app/CLI pattern) is the one exception: it is allowed unconditionally (it
+   never leaves the machine), so a CLI can use `http://127.0.0.1:<port>/callback` against an https
+   issuer without relaxing anything else. A non-loopback `http:` redirect URI is always rejected.
+   Tokens are never logged.
 
 ## Security
 

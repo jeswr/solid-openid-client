@@ -137,23 +137,34 @@ describe("createSolidOidcClient — construction guards", () => {
         clientId: CLIENT_ID,
         redirectUri: "http://app.example/callback",
       }),
-    ).rejects.toThrow(/redirectUri.*insecure|insecure http/i);
+    ).rejects.toThrow(/redirectUri.*https|non-loopback/i);
   });
 
-  it("allows an http LOOPBACK redirectUri with allowInsecure", async () => {
-    const op = await createMockOp({
-      issuer: "http://localhost:3000/",
-      clientId: CLIENT_ID,
-      webId: WEBID,
-    });
+  // Regression (roborev Medium, whole-tree-10): a LOOPBACK http redirect URI (the RFC 8252
+  // native-app/CLI pattern) is allowed WITHOUT allowInsecure, even against an HTTPS issuer — it
+  // never leaves the machine, so it must not force relaxing the issuer/endpoint/resource rules.
+  it.each([
+    "http://127.0.0.1:8080/callback",
+    "http://[::1]:8080/callback",
+    "http://localhost:8080/callback",
+  ])("allows the loopback http redirectUri %s against an https issuer (no allowInsecure)", async (redirectUri) => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
     const client = await createSolidOidcClient({
-      issuer: "http://localhost:3000/",
+      issuer: ISSUER, // https
       clientId: CLIENT_ID,
-      redirectUri: "http://127.0.0.1:8080/callback", // loopback http
+      redirectUri,
       fetch: op.fetch,
-      allowInsecure: true,
+      // NO allowInsecure — a loopback redirect is permitted unconditionally.
     });
-    expect(client.issuer).toBe("http://localhost:3000/");
+    expect(client.issuer).toBe(ISSUER);
+    // and the loopback redirect flows end-to-end (the mock validates redirect_uri at /token)
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const session = await client.handleCallback(
+      { url: `${redirectUri}?code=${code}&state=${returnedState}` },
+      state,
+    );
+    expect(session.webId).toBe(WEBID);
   });
 
   // Regression (roborev High, whole-tree-5): even with allowInsecure (loopback issuer), a

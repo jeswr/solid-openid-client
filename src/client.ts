@@ -194,18 +194,22 @@ function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
 }
 
 /**
- * Assert the redirect URI is a valid absolute URL, on a secure transport, with NO query/fragment.
+ * Assert the redirect URI is a valid absolute URL, on a safe transport, with NO query/fragment.
  *
- * - Transport: https (or http on a loopback host only when `allowInsecure`) — same rule as the
- *   issuer/endpoints, so an authorization code is never delivered over plaintext to a real host (a
- *   roborev finding).
+ * - Transport: `https:` for any real host; `http:` is permitted for a LOOPBACK host
+ *   UNCONDITIONALLY (independent of `allowInsecure`). A loopback redirect URI
+ *   (`http://127.0.0.1:<port>/callback`, `[::1]`, `localhost`) is the RFC 8252 §7.3 native-app /
+ *   CLI pattern — it never leaves the machine, so it carries no plaintext-over-network risk and
+ *   must work against an https issuer without relaxing the issuer/endpoint/resource transport rules
+ *   (a roborev finding). A non-loopback `http:` redirect URI is always rejected (an authorization
+ *   code would be delivered over plaintext to a real host).
  * - No query/fragment: openid-client v6 derives the token-endpoint `redirect_uri` from the callback
  *   URL's origin+path (query stripped), so a registered redirect URI carrying its own query — e.g.
  *   `https://app.example/callback?tenant=a` — would be sent to the OP as `.../callback`, a mismatch
  *   the OP rejects. We reject it up front with a clear error; carry per-flow data in
  *   `state`/`extraParams`, not the redirect URI's query.
  */
-function assertRedirectUri(redirectUri: string, allowInsecure: boolean): void {
+function assertRedirectUri(redirectUri: string): void {
   let u: URL;
   try {
     u = new URL(redirectUri);
@@ -214,11 +218,17 @@ function assertRedirectUri(redirectUri: string, allowInsecure: boolean): void {
       `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`,
     );
   }
-  assertSecureTransport(
-    redirectUri,
-    allowInsecure,
-    (msg) => new Error(`createSolidOidcClient: \`redirectUri\` ${msg}`),
-  );
+  if (u.protocol === "http:" && !isLoopbackHost(u.hostname)) {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` must be https for a non-loopback host (${redirectUri}). ` +
+        "http: is permitted only for a loopback redirect URI (the RFC 8252 native-app pattern).",
+    );
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` has an unsupported scheme (${redirectUri}); expected https:.`,
+    );
+  }
   if (u.search !== "" || u.hash !== "") {
     throw new Error(
       `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). ` +
@@ -406,7 +416,7 @@ export async function createSolidOidcClient(
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
-  assertRedirectUri(redirectUri, allowInsecure);
+  assertRedirectUri(redirectUri);
   const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   // The consumer's DOM-shaped fetch (test seam / SSRF-guarded fetch in prod). Used directly for
   // the resource-leg authed fetch, and adapted to openid-client's `CustomFetch` for discovery /
