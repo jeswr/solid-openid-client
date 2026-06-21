@@ -47,6 +47,12 @@ export interface MockOpOptions {
   readonly omitIdToken?: boolean;
   /** Grant a refresh token (offline_access). Default true. */
   readonly grantRefreshToken?: boolean;
+  /**
+   * Whether a refresh response ROTATES (re-issues) the refresh token. Default true. When false the
+   * OP omits `refresh_token` from a refresh response (a non-rotating OP) — used to test that the
+   * client carries the prior refresh token forward.
+   */
+  readonly rotateRefreshTokenOnRefresh?: boolean;
 }
 
 export interface MockOp {
@@ -229,7 +235,9 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
       // A refreshed ID token carries the same webid; nonce is not required on refresh.
       const idToken = opts.omitIdToken ? undefined : await mintIdTokenNoNonce(opts.webId);
       const accessToken = await mintAccessToken();
-      return tokenResponse(accessToken, idToken, tokenDpop, "refresh-rotated");
+      // A non-rotating OP omits refresh_token from a refresh response.
+      const rotate = opts.rotateRefreshTokenOnRefresh !== false;
+      return tokenResponse(accessToken, idToken, tokenDpop, "refresh-rotated", rotate);
     }
 
     return json({ error: "unsupported_grant_type" }, 400);
@@ -254,6 +262,7 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
     idToken: string | undefined,
     tokenDpop: string | undefined,
     refreshSuffix = "initial",
+    includeRefreshToken = true,
   ): Response {
     // Whether the OP saw a DPoP proof on the token request is asserted via captured headers, not
     // an echoed body field. `tokenDpop` is read so an unused-param lint does not fire.
@@ -267,7 +276,7 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
     if (idToken !== undefined) {
       out.id_token = idToken;
     }
-    if (grantRefreshToken) {
+    if (grantRefreshToken && includeRefreshToken) {
       out.refresh_token = `refresh-${refreshSuffix}-${accessTokenCounter}`;
     }
     return json(out);

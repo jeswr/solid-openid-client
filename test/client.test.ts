@@ -134,6 +134,38 @@ describe("authorizationUrl — PKCE / state / nonce ALWAYS present", () => {
     expect(a.state.state).not.toBe(b.state.state);
     expect(a.state.nonce).not.toBe(b.state.nonce);
   });
+
+  it("passes through a non-reserved extra param (e.g. prompt)", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url } = await client.authorizationUrl({ prompt: "consent" });
+    expect(new URL(url).searchParams.get("prompt")).toBe("consent");
+  });
+
+  // Regression (roborev Medium, whole-tree): a caller MUST NOT override security params.
+  it.each([
+    "state",
+    "nonce",
+    "code_challenge",
+    "scope",
+    "response_type",
+    "redirect_uri",
+    "client_id",
+  ])("REJECTS an extraParams attempt to override the reserved param %s", async (reserved) => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    await expect(client.authorizationUrl({ [reserved]: "attacker" })).rejects.toThrow(/reserved/i);
+  });
 });
 
 describe("handleCallback — happy path", () => {
@@ -348,6 +380,30 @@ describe("refresh", () => {
     const { client, session } = await login();
     const refreshed = await client.refresh(session.tokens.refreshToken);
     expect(refreshed.accessToken).toBeTruthy();
+  });
+
+  // Regression (roborev Medium, whole-tree): a non-rotating OP omits refresh_token on refresh;
+  // the client must carry the prior refresh token forward so a SECOND refresh still works.
+  it("carries the prior refresh token forward when the OP does not rotate it", async () => {
+    const { client, session } = await login({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: WEBID,
+      rotateRefreshTokenOnRefresh: false, // refresh responses omit refresh_token
+    });
+    const original = session.tokens.refreshToken as string;
+    expect(original).toBeTruthy();
+
+    const first = await client.refresh();
+    // The response omitted refresh_token; the client kept the original one.
+    expect(first.refreshToken).toBe(original);
+    expect(client.currentTokens()?.refreshToken).toBe(original);
+
+    // A SECOND refresh must still succeed (the token was not lost).
+    const second = await client.refresh();
+    expect(second.accessToken).toBeTruthy();
+    expect(second.accessToken).not.toBe(first.accessToken);
+    expect(second.refreshToken).toBe(original);
   });
 });
 
