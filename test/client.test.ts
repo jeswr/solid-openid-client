@@ -128,6 +128,34 @@ describe("createSolidOidcClient — construction guards", () => {
     ).rejects.toThrow(/query string or fragment/i);
   });
 
+  // Regression (roborev Medium, whole-tree-7): a non-https redirectUri (non-loopback) is rejected
+  // — an authorization code must not be delivered over plaintext.
+  it("rejects an http non-loopback redirectUri", async () => {
+    await expect(
+      createSolidOidcClient({
+        issuer: ISSUER,
+        clientId: CLIENT_ID,
+        redirectUri: "http://app.example/callback",
+      }),
+    ).rejects.toThrow(/redirectUri.*insecure|insecure http/i);
+  });
+
+  it("allows an http LOOPBACK redirectUri with allowInsecure", async () => {
+    const op = await createMockOp({
+      issuer: "http://localhost:3000/",
+      clientId: CLIENT_ID,
+      webId: WEBID,
+    });
+    const client = await createSolidOidcClient({
+      issuer: "http://localhost:3000/",
+      clientId: CLIENT_ID,
+      redirectUri: "http://127.0.0.1:8080/callback", // loopback http
+      fetch: op.fetch,
+      allowInsecure: true,
+    });
+    expect(client.issuer).toBe("http://localhost:3000/");
+  });
+
   // Regression (roborev High, whole-tree-5): even with allowInsecure (loopback issuer), a
   // discovered token_endpoint on a NON-loopback http host must be rejected (token-leak guard).
   it("rejects a discovered http non-loopback token_endpoint even with allowInsecure", async () => {
@@ -260,6 +288,61 @@ describe("handleCallback — happy path", () => {
     const { client, session } = await login();
     expect(client.currentWebId()).toBe(session.webId);
     expect(client.currentTokens()?.accessToken).toBe(session.tokens.accessToken);
+  });
+
+  // Regression (roborev Medium, whole-tree-7): a confidential client honours
+  // token_endpoint_auth_method (client_secret_basic → Basic header, not a body secret).
+  it("honours client_secret_basic for a confidential client (auth in the Basic header)", async () => {
+    const op = await createMockOp({
+      issuer: ISSUER,
+      clientId: "confidential-client",
+      webId: WEBID,
+    });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      redirectUri: REDIRECT_URI,
+      client: {
+        clientId: "confidential-client",
+        clientSecret: "s3cret",
+        clientMetadata: { token_endpoint_auth_method: "client_secret_basic" },
+      },
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    await client.handleCallback(
+      { url: `${REDIRECT_URI}?code=${code}&state=${returnedState}` },
+      state,
+    );
+    const tokenReq = op.captured.find((r) => r.url.endsWith("/token") && r.method === "POST");
+    // Basic auth → Authorization: Basic base64(client_id:secret); the secret is NOT in the body.
+    expect(tokenReq?.headers.authorization).toMatch(/^Basic /i);
+    const decoded = Buffer.from(
+      (tokenReq?.headers.authorization as string).slice("Basic ".length),
+      "base64",
+    ).toString("utf8");
+    expect(decoded).toContain("s3cret");
+    expect(tokenReq?.body ?? "").not.toContain("s3cret");
+  });
+
+  // client_secret_post (default for a confidential client) puts the secret in the body, not a header.
+  it("defaults a confidential client to client_secret_post (secret in the body)", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: "confidential-post", webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      redirectUri: REDIRECT_URI,
+      client: { clientId: "confidential-post", clientSecret: "p0stsecret" },
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    await client.handleCallback(
+      { url: `${REDIRECT_URI}?code=${code}&state=${returnedState}` },
+      state,
+    );
+    const tokenReq = op.captured.find((r) => r.url.endsWith("/token") && r.method === "POST");
+    expect(tokenReq?.headers.authorization).toBeUndefined();
+    expect(tokenReq?.body ?? "").toContain("p0stsecret");
   });
 
   it("accepts the params form of the callback input", async () => {

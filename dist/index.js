@@ -107,6 +107,22 @@ function resolveIdentity(opts) {
 function hasSecret(id) {
   return "clientSecret" in id && typeof id.clientSecret === "string" && id.clientSecret.length > 0;
 }
+function selectClientAuth(identity, tokenEndpointAuthMethod) {
+  if (!hasSecret(identity)) {
+    return oidc.None();
+  }
+  const secret = identity.clientSecret;
+  switch (tokenEndpointAuthMethod) {
+    case "client_secret_basic":
+      return oidc.ClientSecretBasic(secret);
+    case "none":
+      return oidc.None();
+    case "client_secret_jwt":
+      return oidc.ClientSecretJwt(secret);
+    default:
+      return oidc.ClientSecretPost(secret);
+  }
+}
 function isLoopbackHost2(hostname) {
   const host = hostname.toLowerCase();
   if (host === "localhost") {
@@ -145,7 +161,7 @@ function assertSecureTransport(rawUrl, allowInsecure, makeError) {
 function assertIssuerTransport2(issuer, allowInsecure) {
   assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
 }
-function assertRedirectUri(redirectUri) {
+function assertRedirectUri(redirectUri, allowInsecure) {
   let u;
   try {
     u = new URL(redirectUri);
@@ -154,6 +170,11 @@ function assertRedirectUri(redirectUri) {
       `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`
     );
   }
+  assertSecureTransport(
+    redirectUri,
+    allowInsecure,
+    (msg) => new Error(`createSolidOidcClient: \`redirectUri\` ${msg}`)
+  );
   if (u.search !== "" || u.hash !== "") {
     throw new Error(
       `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). openid-client derives the token-endpoint redirect_uri from the callback origin+path (query stripped), so a query here would mismatch and the OP would reject the code exchange. Carry per-flow data in \`state\` / \`authorizationUrl(extraParams)\` instead.`
@@ -220,7 +241,7 @@ async function createSolidOidcClient(opts) {
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
-  assertRedirectUri(redirectUri);
+  assertRedirectUri(redirectUri, allowInsecure);
   const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   const userFetch = opts.fetch ?? globalThis.fetch;
   const dpopKeyPair = opts.dpopKeyPair ?? await generateDpopKeyPair();
@@ -229,10 +250,14 @@ async function createSolidOidcClient(opts) {
     redirect_uris: [redirectUri],
     ..."clientMetadata" in identity && identity.clientMetadata || {}
   };
-  const clientAuth = hasSecret(identity) ? oidc.ClientSecretPost(identity.clientSecret) : oidc.None();
   if (hasSecret(identity)) {
     baseMetadata.client_secret = identity.clientSecret;
   }
+  const authMethod = baseMetadata.token_endpoint_auth_method;
+  const clientAuth = selectClientAuth(
+    identity,
+    typeof authMethod === "string" ? authMethod : void 0
+  );
   const discoveryOptions = {
     [oidc.customFetch]: adaptCustomFetch(userFetch),
     ...allowInsecure ? { execute: [oidc.allowInsecureRequests] } : {}

@@ -103,6 +103,37 @@ function hasSecret(id: ClientIdentity): id is ClientIdentity & { clientSecret: s
 }
 
 /**
+ * Select the openid-client client-authentication method.
+ *
+ * A PUBLIC client (no secret) always uses `none`. A CONFIDENTIAL client honours its
+ * `token_endpoint_auth_method` (from `clientMetadata`) so a client registered for
+ * `client_secret_basic` works — not only `client_secret_post` (a roborev finding); the default for
+ * a confidential client is `client_secret_post`. A `none` method on a client that nonetheless
+ * carries a secret is honoured as requested. The JWT-assertion / mTLS methods are not wired here
+ * (they need a private key / cert beyond a shared secret); request them via a future option.
+ */
+function selectClientAuth(
+  identity: ClientIdentity,
+  tokenEndpointAuthMethod: string | undefined,
+): oidc.ClientAuth {
+  if (!hasSecret(identity)) {
+    return oidc.None();
+  }
+  const secret = identity.clientSecret;
+  switch (tokenEndpointAuthMethod) {
+    case "client_secret_basic":
+      return oidc.ClientSecretBasic(secret);
+    case "none":
+      return oidc.None();
+    case "client_secret_jwt":
+      return oidc.ClientSecretJwt(secret);
+    default:
+      // client_secret_post (the default) or an unrecognised value → POST.
+      return oidc.ClientSecretPost(secret);
+  }
+}
+
+/**
  * True iff `hostname` (as returned by `URL.hostname`) is a loopback host. Handles `localhost`, the
  * whole `127.0.0.0/8` IPv4 loopback range, and IPv6 `::1` — including Node's BRACKETED IPv6 form
  * (`URL.hostname` returns `[::1]` with brackets, so a bare `=== "::1"` check would miss it).
@@ -162,16 +193,18 @@ function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
 }
 
 /**
- * Assert the redirect URI is a valid absolute URL with NO query string or fragment.
+ * Assert the redirect URI is a valid absolute URL, on a secure transport, with NO query/fragment.
  *
- * openid-client v6 derives the token-endpoint `redirect_uri` from the callback URL's origin+path
- * (query stripped), so a registered redirect URI carrying its own query — e.g.
- * `https://app.example/callback?tenant=a` — would be sent to the OP as `.../callback`, a mismatch
- * the OP rejects. Rather than silently break the grant, we reject such a redirect URI up front with
- * a clear error (a roborev finding). Carry per-flow data in `state`/`extraParams`, not the
- * redirect URI's query.
+ * - Transport: https (or http on a loopback host only when `allowInsecure`) — same rule as the
+ *   issuer/endpoints, so an authorization code is never delivered over plaintext to a real host (a
+ *   roborev finding).
+ * - No query/fragment: openid-client v6 derives the token-endpoint `redirect_uri` from the callback
+ *   URL's origin+path (query stripped), so a registered redirect URI carrying its own query — e.g.
+ *   `https://app.example/callback?tenant=a` — would be sent to the OP as `.../callback`, a mismatch
+ *   the OP rejects. We reject it up front with a clear error; carry per-flow data in
+ *   `state`/`extraParams`, not the redirect URI's query.
  */
-function assertRedirectUri(redirectUri: string): void {
+function assertRedirectUri(redirectUri: string, allowInsecure: boolean): void {
   let u: URL;
   try {
     u = new URL(redirectUri);
@@ -180,6 +213,11 @@ function assertRedirectUri(redirectUri: string): void {
       `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`,
     );
   }
+  assertSecureTransport(
+    redirectUri,
+    allowInsecure,
+    (msg) => new Error(`createSolidOidcClient: \`redirectUri\` ${msg}`),
+  );
   if (u.search !== "" || u.hash !== "") {
     throw new Error(
       `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). ` +
@@ -356,7 +394,7 @@ export async function createSolidOidcClient(
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
-  assertRedirectUri(redirectUri);
+  assertRedirectUri(redirectUri, allowInsecure);
   const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   // The consumer's DOM-shaped fetch (test seam / SSRF-guarded fetch in prod). Used directly for
   // the resource-leg authed fetch, and adapted to openid-client's `CustomFetch` for discovery /
@@ -375,12 +413,18 @@ export async function createSolidOidcClient(
     redirect_uris: [redirectUri],
     ...(("clientMetadata" in identity && identity.clientMetadata) || {}),
   };
-  const clientAuth = hasSecret(identity)
-    ? oidc.ClientSecretPost(identity.clientSecret)
-    : oidc.None();
   if (hasSecret(identity)) {
     baseMetadata.client_secret = identity.clientSecret;
   }
+  // Client authentication method: a confidential client honours its
+  // `clientMetadata.token_endpoint_auth_method` (so a client registered for `client_secret_basic`
+  // works, not only `client_secret_post`; a roborev finding); default for a confidential client is
+  // `client_secret_post`. A public client (no secret) uses `none`.
+  const authMethod = baseMetadata.token_endpoint_auth_method;
+  const clientAuth = selectClientAuth(
+    identity,
+    typeof authMethod === "string" ? authMethod : undefined,
+  );
 
   // Discovery — inject the custom fetch (test seam / SSRF-guarded fetch in prod) and, for a
   // loopback dev OP, allow insecure requests. openid-client's `CustomFetch` has a narrower
