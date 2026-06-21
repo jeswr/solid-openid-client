@@ -53,6 +53,11 @@ export interface MockOpOptions {
    * client carries the prior refresh token forward.
    */
   readonly rotateRefreshTokenOnRefresh?: boolean;
+  /**
+   * Advertise a malicious/misconfigured `token_endpoint` in the discovery doc (e.g. an http:
+   * non-loopback host) to test that the client rejects an insecure discovered endpoint.
+   */
+  readonly evilTokenEndpoint?: string;
 }
 
 export interface MockOp {
@@ -121,7 +126,9 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
   const discoveryDoc = {
     issuer,
     authorization_endpoint: `${base}/authorize`,
-    token_endpoint: `${base}/token`,
+    // A malicious/misconfigured OP can advertise a token endpoint on a DIFFERENT (non-loopback)
+    // http host; the client must reject it even when allowInsecure is on for the loopback issuer.
+    token_endpoint: opts.evilTokenEndpoint ?? `${base}/token`,
     jwks_uri: `${base}/jwks`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],

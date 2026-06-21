@@ -116,6 +116,37 @@ describe("createSolidOidcClient — construction guards", () => {
       } as Parameters<typeof createSolidOidcClient>[0]),
     ).rejects.toThrow(/client identity is required/i);
   });
+
+  // Regression (roborev Medium, whole-tree-5): a redirectUri with a query/fragment is rejected
+  // (openid-client strips query when deriving the token-endpoint redirect_uri → OP mismatch).
+  it.each([
+    "https://app.example/callback?tenant=a",
+    "https://app.example/callback#frag",
+  ])("rejects a redirectUri with a query/fragment: %s", async (redirectUri) => {
+    await expect(
+      createSolidOidcClient({ issuer: ISSUER, clientId: CLIENT_ID, redirectUri }),
+    ).rejects.toThrow(/query string or fragment/i);
+  });
+
+  // Regression (roborev High, whole-tree-5): even with allowInsecure (loopback issuer), a
+  // discovered token_endpoint on a NON-loopback http host must be rejected (token-leak guard).
+  it("rejects a discovered http non-loopback token_endpoint even with allowInsecure", async () => {
+    const op = await createMockOp({
+      issuer: "http://localhost:3000/",
+      clientId: CLIENT_ID,
+      webId: WEBID,
+      evilTokenEndpoint: "http://evil.example/token", // non-loopback http
+    });
+    await expect(
+      createSolidOidcClient({
+        issuer: "http://localhost:3000/",
+        clientId: CLIENT_ID,
+        redirectUri: "http://localhost:3000/callback",
+        fetch: op.fetch,
+        allowInsecure: true,
+      }),
+    ).rejects.toThrow(/token_endpoint.*insecure|insecure.*endpoint/i);
+  });
 });
 
 describe("authorizationUrl — PKCE / state / nonce ALWAYS present", () => {
@@ -836,18 +867,60 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     }
   });
 
+  // Regression (roborev Low, round 5): document.baseURI (which honours <base href>) is preferred
+  // over location.href, matching native fetch.
+  it("prefers document.baseURI (<base href>) over location.href for relative URLs", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    const g = globalThis as { document?: unknown; location?: unknown };
+    const hadDoc = "document" in globalThis;
+    const hadLoc = "location" in globalThis;
+    const prevDoc = g.document;
+    const prevLoc = g.location;
+    // location says one origin/path, but <base href> (document.baseURI) says another — base wins.
+    g.location = { href: "https://op.example/some/other/page" };
+    g.document = { baseURI: "https://op.example/base/" };
+    try {
+      const res = await client.fetch("doc.ttl"); // relative, no leading slash → resolved vs base
+      expect(res.status).toBe(200);
+      const sent = op.captured.find((r) => r.url.includes("doc.ttl"));
+      expect(sent?.url).toBe("https://op.example/base/doc.ttl");
+    } finally {
+      if (hadDoc) {
+        g.document = prevDoc;
+      } else {
+        // biome-ignore lint/performance/noDelete: test cleanup of a stubbed global
+        delete g.document;
+      }
+      if (hadLoc) {
+        g.location = prevLoc;
+      } else {
+        // biome-ignore lint/performance/noDelete: test cleanup of a stubbed global
+        delete g.location;
+      }
+    }
+  });
+
   // Server-side (no document base): a relative URL throws a clear error rather than a raw URL parse.
   it("throws a clear error for a relative URL with no document base (server-side)", async () => {
     const { client } = await login();
-    const hadLocation = "location" in globalThis;
-    const prev = (globalThis as { location?: unknown }).location;
+    const g = globalThis as { document?: unknown; location?: unknown };
+    const hadDoc = "document" in globalThis;
+    const hadLoc = "location" in globalThis;
+    const prevDoc = g.document;
+    const prevLoc = g.location;
     // biome-ignore lint/performance/noDelete: ensure no document base for this assertion
-    delete (globalThis as { location?: unknown }).location;
+    delete g.document;
+    // biome-ignore lint/performance/noDelete: ensure no document base for this assertion
+    delete g.location;
     try {
       await expect(client.fetch("/resource/doc.ttl")).rejects.toThrow(/absolute URL/i);
     } finally {
-      if (hadLocation) {
-        (globalThis as { location?: unknown }).location = prev;
+      if (hadDoc) {
+        g.document = prevDoc;
+      }
+      if (hadLoc) {
+        g.location = prevLoc;
       }
     }
   });

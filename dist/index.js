@@ -145,11 +145,27 @@ function assertSecureTransport(rawUrl, allowInsecure, makeError) {
 function assertIssuerTransport2(issuer, allowInsecure) {
   assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
 }
+function assertRedirectUri(redirectUri) {
+  let u;
+  try {
+    u = new URL(redirectUri);
+  } catch {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`
+    );
+  }
+  if (u.search !== "" || u.hash !== "") {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). openid-client derives the token-endpoint redirect_uri from the callback origin+path (query stripped), so a query here would mismatch and the OP would reject the code exchange. Carry per-flow data in \`state\` / \`authorizationUrl(extraParams)\` instead.`
+    );
+  }
+}
 function resolveUrl(input) {
   if (input instanceof URL) {
     return input.toString();
   }
-  const base = globalThis.location?.href;
+  const g = globalThis;
+  const base = g.document?.baseURI ?? g.location?.href;
   try {
     return base !== void 0 ? new URL(input, base).toString() : new URL(input).toString();
   } catch {
@@ -199,6 +215,7 @@ async function createSolidOidcClient(opts) {
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
+  assertRedirectUri(redirectUri);
   const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   const userFetch = opts.fetch ?? globalThis.fetch;
   const dpopKeyPair = opts.dpopKeyPair ?? await generateDpopKeyPair();
@@ -222,11 +239,27 @@ async function createSolidOidcClient(opts) {
     clientAuth,
     discoveryOptions
   );
-  const discoveredIssuer = config.serverMetadata().issuer;
+  const serverMetadata = config.serverMetadata();
+  const discoveredIssuer = serverMetadata.issuer;
   if (discoveredIssuer !== opts.issuer && discoveredIssuer !== stripTrailingSlash(opts.issuer)) {
     if (stripTrailingSlash(discoveredIssuer) !== stripTrailingSlash(opts.issuer)) {
       throw new Error(
         `createSolidOidcClient: discovered issuer (${discoveredIssuer}) does not match the requested issuer (${opts.issuer}).`
+      );
+    }
+  }
+  for (const [name, endpoint] of [
+    ["authorization_endpoint", serverMetadata.authorization_endpoint],
+    ["token_endpoint", serverMetadata.token_endpoint],
+    ["jwks_uri", serverMetadata.jwks_uri]
+  ]) {
+    if (typeof endpoint === "string" && endpoint.length > 0) {
+      assertSecureTransport(
+        endpoint,
+        allowInsecure,
+        (msg) => new Error(
+          `createSolidOidcClient: discovered ${name} ${msg} (refusing an insecure endpoint).`
+        )
       );
     }
   }

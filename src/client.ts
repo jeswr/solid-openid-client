@@ -162,17 +162,53 @@ function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
 }
 
 /**
+ * Assert the redirect URI is a valid absolute URL with NO query string or fragment.
+ *
+ * openid-client v6 derives the token-endpoint `redirect_uri` from the callback URL's origin+path
+ * (query stripped), so a registered redirect URI carrying its own query — e.g.
+ * `https://app.example/callback?tenant=a` — would be sent to the OP as `.../callback`, a mismatch
+ * the OP rejects. Rather than silently break the grant, we reject such a redirect URI up front with
+ * a clear error (a roborev finding). Carry per-flow data in `state`/`extraParams`, not the
+ * redirect URI's query.
+ */
+function assertRedirectUri(redirectUri: string): void {
+  let u: URL;
+  try {
+    u = new URL(redirectUri);
+  } catch {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`,
+    );
+  }
+  if (u.search !== "" || u.hash !== "") {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). ` +
+        "openid-client derives the token-endpoint redirect_uri from the callback origin+path (query " +
+        "stripped), so a query here would mismatch and the OP would reject the code exchange. Carry " +
+        "per-flow data in `state` / `authorizationUrl(extraParams)` instead.",
+    );
+  }
+}
+
+/**
  * Resolve a string/URL `fetch` input to an absolute URL string, the way browser `fetch` does: a
- * relative URL is resolved against the document base (`globalThis.location.href`) when present (a
- * browser/worker), else it must be absolute (server-side Node has no base — a relative URL throws a
- * clear error). This keeps the authed `fetch` a drop-in for the DOM `fetch` in a browser context
- * while staying strict server-side.
+ * relative URL is resolved against the document base when present (a browser/worker), else it must
+ * be absolute (server-side Node has no base — a relative URL throws a clear error). This keeps the
+ * authed `fetch` a drop-in for the DOM `fetch` in a browser context while staying strict
+ * server-side.
+ *
+ * The base is `document.baseURI` (which honours a `<base href>`) when in a document context —
+ * matching native `fetch` exactly — falling back to `location.href` for a worker-like context.
  */
 function resolveUrl(input: string | URL): string {
   if (input instanceof URL) {
     return input.toString();
   }
-  const base = (globalThis as { location?: { href?: string } }).location?.href;
+  const g = globalThis as {
+    document?: { baseURI?: string };
+    location?: { href?: string };
+  };
+  const base = g.document?.baseURI ?? g.location?.href;
   try {
     return base !== undefined ? new URL(input, base).toString() : new URL(input).toString();
   } catch {
@@ -304,6 +340,7 @@ export async function createSolidOidcClient(
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
+  assertRedirectUri(redirectUri);
   const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   // The consumer's DOM-shaped fetch (test seam / SSRF-guarded fetch in prod). Used directly for
   // the resource-leg authed fetch, and adapted to openid-client's `CustomFetch` for discovery /
@@ -346,12 +383,36 @@ export async function createSolidOidcClient(
   );
 
   // The issuer reported by the OP must equal the requested issuer exactly (OIDC Discovery §4.3).
-  const discoveredIssuer = config.serverMetadata().issuer;
+  const serverMetadata = config.serverMetadata();
+  const discoveredIssuer = serverMetadata.issuer;
   if (discoveredIssuer !== opts.issuer && discoveredIssuer !== stripTrailingSlash(opts.issuer)) {
     // Allow only the trailing-slash difference; anything else is an issuer-substitution attempt.
     if (stripTrailingSlash(discoveredIssuer) !== stripTrailingSlash(opts.issuer)) {
       throw new Error(
         `createSolidOidcClient: discovered issuer (${discoveredIssuer}) does not match the requested issuer (${opts.issuer}).`,
+      );
+    }
+  }
+
+  // SECURITY: when `allowInsecure` enables http: for a loopback dev OP, openid-client's
+  // `allowInsecureRequests` disables TLS enforcement for ALL endpoints — so a (loopback) discovery
+  // document could advertise an `http://non-loopback/token` and leak the code/token over plaintext
+  // to an arbitrary host. Re-apply the same https-or-loopback rule to EVERY endpoint we will
+  // actually contact, after discovery (a roborev finding). With `allowInsecure` off, openid-client
+  // already enforces https, but we check anyway (defense-in-depth, zero cost).
+  for (const [name, endpoint] of [
+    ["authorization_endpoint", serverMetadata.authorization_endpoint],
+    ["token_endpoint", serverMetadata.token_endpoint],
+    ["jwks_uri", serverMetadata.jwks_uri],
+  ] as const) {
+    if (typeof endpoint === "string" && endpoint.length > 0) {
+      assertSecureTransport(
+        endpoint,
+        allowInsecure,
+        (msg) =>
+          new Error(
+            `createSolidOidcClient: discovered ${name} ${msg} (refusing an insecure endpoint).`,
+          ),
       );
     }
   }
