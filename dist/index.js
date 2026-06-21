@@ -233,7 +233,10 @@ async function createSolidOidcClient(opts) {
         effectiveSignal
       );
     } else if (reqInput && reqInput.body !== null) {
-      bufferedBody = await readBodyWithSignal(reqInput.clone(), effectiveSignal);
+      bufferedBody = await readStreamWithSignal(
+        reqInput.clone().body,
+        effectiveSignal
+      );
     }
     const buildHeaders = (proof) => {
       const headers = new Headers(reqInput?.headers ?? void 0);
@@ -367,37 +370,52 @@ async function bufferBody(body, signal) {
     return void 0;
   }
   if (body instanceof ReadableStream) {
-    return readBodyWithSignal(new Response(body), signal);
+    return readStreamWithSignal(body, signal);
   }
   return body;
 }
-async function readBodyWithSignal(body, signal) {
-  if (signal === void 0) {
-    return body.arrayBuffer();
-  }
-  if (signal.aborted) {
-    void body.body?.cancel().catch(() => {
+async function readStreamWithSignal(stream, signal) {
+  const reader = stream.getReader();
+  const abortPromise = () => new Promise((_resolve, reject) => {
+    if (signal === void 0) {
+      return;
+    }
+    if (signal.aborted) {
+      reject(abortReason(signal));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+  });
+  if (signal?.aborted) {
+    await reader.cancel(abortReason(signal)).catch(() => {
     });
     throw abortReason(signal);
   }
-  return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      void body.body?.cancel().catch(() => {
-      });
-      reject(abortReason(signal));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    body.arrayBuffer().then(
-      (buf) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(buf);
-      },
-      (err) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
+  const chunks = [];
+  let total = 0;
+  try {
+    for (; ; ) {
+      const result = signal === void 0 ? await reader.read() : await Promise.race([reader.read(), abortPromise()]);
+      if (result.done) {
+        break;
       }
-    );
-  });
+      chunks.push(result.value);
+      total += result.value.byteLength;
+    }
+  } catch (err) {
+    await reader.cancel(err).catch(() => {
+    });
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer.slice(0, total);
 }
 function abortReason(signal) {
   const reason = signal.reason;

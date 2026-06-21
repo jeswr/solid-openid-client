@@ -535,16 +535,22 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     expect(seenInit?.signal?.aborted).toBe(true);
   });
 
-  // Regression (roborev Medium round 3): an abort during stream-body buffering rejects promptly,
-  // rather than draining the stream / hanging.
-  it("aborts promptly while buffering a stream body when the signal fires", async () => {
+  // Regression (roborev Medium round 3 + 4): an abort during stream-body buffering rejects
+  // promptly AND actually CANCELS the active read (not just rejects the promise while the stream
+  // keeps draining). We use our own reader, so cancel() reaches the underlying source.
+  it("aborts promptly AND cancels the stream read while buffering when the signal fires", async () => {
     const { client } = await login();
     const ac = new AbortController();
+    let cancelled = false;
     // A stream that never closes — without abort-aware buffering, reading it would hang forever.
+    // Its `cancel` records that the source was actually told to stop.
     const neverEnding = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode("partial"));
         // never close, never enqueue more
+      },
+      cancel() {
+        cancelled = true;
       },
     });
     const p = client.fetch("https://op.example/resource/doc.ttl", {
@@ -556,6 +562,8 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     });
     ac.abort();
     await expect(p).rejects.toThrow();
+    // The underlying stream source was cancelled — the read did not keep draining in the background.
+    expect(cancelled).toBe(true);
   });
 
   // Already-aborted signal rejects immediately (does not even start the request).

@@ -357,8 +357,12 @@ export async function createSolidOidcClient(
         effectiveSignal,
       );
     } else if (reqInput && reqInput.body !== null) {
-      // A Request body is a stream; read it to an ArrayBuffer so we can send it more than once.
-      bufferedBody = await readBodyWithSignal(reqInput.clone(), effectiveSignal);
+      // A Request body is a stream; read it (abort-aware, cancellable) so we can send it more
+      // than once across the original + nonce retry.
+      bufferedBody = await readStreamWithSignal(
+        reqInput.clone().body as ReadableStream<Uint8Array>,
+        effectiveSignal,
+      );
     }
 
     // Merge headers from the Request then the init (init overrides), so a Request's content-type
@@ -531,46 +535,73 @@ async function bufferBody(
     return undefined;
   }
   if (body instanceof ReadableStream) {
-    return readBodyWithSignal(new Response(body), signal);
+    return readStreamWithSignal(body, signal);
   }
   return body;
 }
 
 /**
- * Read a `Response`/`Request`'s body to an `ArrayBuffer`, racing the read against an optional
- * `AbortSignal` so an aborted request rejects promptly (with the signal's reason / an
- * `AbortError`) instead of draining a slow or unbounded stream. If already aborted, rejects
- * immediately and cancels the underlying stream.
+ * Drain a `ReadableStream<Uint8Array>` to a single `Uint8Array`, honouring an optional
+ * `AbortSignal`. We read MANUALLY via `stream.getReader()` (NOT `new Response(stream).arrayBuffer()`)
+ * because `arrayBuffer()` locks the stream's reader, after which `stream.cancel()` throws and the
+ * in-flight read is NOT cancelled — a never-ending stream would keep draining in the background
+ * even after our promise rejected (a roborev finding). With our own reader we can `reader.cancel()`
+ * on abort, which actually stops the active read. Each `reader.read()` is raced against the abort
+ * so an abort mid-chunk rejects promptly.
  */
-async function readBodyWithSignal(
-  body: Body,
+async function readStreamWithSignal(
+  stream: ReadableStream<Uint8Array>,
   signal: AbortSignal | undefined,
 ): Promise<ArrayBuffer> {
-  if (signal === undefined) {
-    return body.arrayBuffer();
-  }
-  if (signal.aborted) {
-    // Cancel the body stream so it is not left dangling, then reject.
-    void body.body?.cancel().catch(() => {});
+  const reader = stream.getReader();
+  // A promise that rejects when the signal aborts; never resolves otherwise.
+  const abortPromise = (): Promise<never> =>
+    new Promise<never>((_resolve, reject) => {
+      if (signal === undefined) {
+        return; // never rejects — the read drives completion
+      }
+      if (signal.aborted) {
+        reject(abortReason(signal));
+        return;
+      }
+      signal.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+    });
+
+  if (signal?.aborted) {
+    await reader.cancel(abortReason(signal)).catch(() => {});
     throw abortReason(signal);
   }
-  return new Promise<ArrayBuffer>((resolve, reject) => {
-    const onAbort = () => {
-      void body.body?.cancel().catch(() => {});
-      reject(abortReason(signal));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    body.arrayBuffer().then(
-      (buf) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(buf);
-      },
-      (err) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
-      },
-    );
-  });
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const result =
+        signal === undefined
+          ? await reader.read()
+          : await Promise.race([reader.read(), abortPromise()]);
+      if (result.done) {
+        break;
+      }
+      chunks.push(result.value);
+      total += result.value.byteLength;
+    }
+  } catch (err) {
+    // On abort (or any read error) cancel the reader so the source stops producing, then rethrow.
+    await reader.cancel(err).catch(() => {});
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  // Return an ArrayBuffer (a `BodyInit`/`BufferSource`) sized exactly to the bytes read.
+  return out.buffer.slice(0, total);
 }
 
 /** The abort reason if the signal supplies one, else a standard `AbortError`. */
