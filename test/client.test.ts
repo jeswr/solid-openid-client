@@ -504,18 +504,76 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
       state,
     );
     void client; // the first login is just to ensure the helper path is exercised
+    const ac = new AbortController();
     const req = new Request("https://op.example/resource/doc.ttl", {
       method: "GET",
       credentials: "include",
       mode: "cors",
       cache: "no-store",
       redirect: "follow",
+      integrity: "sha256-abc",
+      keepalive: true,
+      referrer: "https://app.example/page",
+      referrerPolicy: "no-referrer",
+      signal: ac.signal,
     });
     await client2.fetch(req);
+    // ALL the carried-over transport fields reach the underlying fetch.
     expect(seenInit?.credentials).toBe("include");
     expect(seenInit?.mode).toBe("cors");
     expect(seenInit?.cache).toBe("no-store");
     expect(seenInit?.redirect).toBe("follow");
+    expect(seenInit?.integrity).toBe("sha256-abc");
+    expect(seenInit?.keepalive).toBe(true);
+    expect(seenInit?.referrer).toBe("https://app.example/page");
+    expect(seenInit?.referrerPolicy).toBe("no-referrer");
+    // A Request wraps the caller's signal in a derived AbortSignal (not the same object), so we
+    // assert the signal is carried over and tracks the original's abort state, not identity.
+    expect(seenInit?.signal).toBeInstanceOf(AbortSignal);
+    expect(seenInit?.signal?.aborted).toBe(false);
+    ac.abort();
+    expect(seenInit?.signal?.aborted).toBe(true);
+  });
+
+  // Regression (roborev Medium round 3): an abort during stream-body buffering rejects promptly,
+  // rather than draining the stream / hanging.
+  it("aborts promptly while buffering a stream body when the signal fires", async () => {
+    const { client } = await login();
+    const ac = new AbortController();
+    // A stream that never closes — without abort-aware buffering, reading it would hang forever.
+    const neverEnding = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("partial"));
+        // never close, never enqueue more
+      },
+    });
+    const p = client.fetch("https://op.example/resource/doc.ttl", {
+      method: "POST",
+      body: neverEnding,
+      signal: ac.signal,
+      // @ts-expect-error duplex is not yet in the DOM RequestInit lib types
+      duplex: "half",
+    });
+    ac.abort();
+    await expect(p).rejects.toThrow();
+  });
+
+  // Already-aborted signal rejects immediately (does not even start the request).
+  it("rejects immediately if the signal is already aborted before buffering", async () => {
+    const { client } = await login();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x"));
+      },
+    });
+    const p = client.fetch("https://op.example/resource/doc.ttl", {
+      method: "POST",
+      body: stream,
+      signal: AbortSignal.abort(),
+      // @ts-expect-error duplex is not yet in the DOM RequestInit lib types
+      duplex: "half",
+    });
+    await expect(p).rejects.toThrow();
   });
 
   // An explicit init.body overrides a Request body (fetch precedence).

@@ -225,11 +225,15 @@ async function createSolidOidcClient(opts) {
       method
     };
     delete baseInit.body;
+    const effectiveSignal = init && "signal" in init ? init.signal ?? void 0 : reqInput?.signal ?? void 0;
     let bufferedBody;
     if (init && "body" in init) {
-      bufferedBody = await bufferBody(init.body ?? void 0);
+      bufferedBody = await bufferBody(
+        init.body ?? void 0,
+        effectiveSignal
+      );
     } else if (reqInput && reqInput.body !== null) {
-      bufferedBody = await reqInput.clone().arrayBuffer();
+      bufferedBody = await readBodyWithSignal(reqInput.clone(), effectiveSignal);
     }
     const buildHeaders = (proof) => {
       const headers = new Headers(reqInput?.headers ?? void 0);
@@ -358,14 +362,49 @@ function requestTransportFields(req) {
     ...req.signal ? { signal: req.signal } : {}
   };
 }
-async function bufferBody(body) {
+async function bufferBody(body, signal) {
   if (body === null || body === void 0) {
     return void 0;
   }
   if (body instanceof ReadableStream) {
-    return new Response(body).arrayBuffer();
+    return readBodyWithSignal(new Response(body), signal);
   }
   return body;
+}
+async function readBodyWithSignal(body, signal) {
+  if (signal === void 0) {
+    return body.arrayBuffer();
+  }
+  if (signal.aborted) {
+    void body.body?.cancel().catch(() => {
+    });
+    throw abortReason(signal);
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      void body.body?.cancel().catch(() => {
+      });
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    body.arrayBuffer().then(
+      (buf) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(buf);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      }
+    );
+  });
+}
+function abortReason(signal) {
+  const reason = signal.reason;
+  if (reason !== void 0) {
+    return reason;
+  }
+  return new DOMException("The operation was aborted.", "AbortError");
 }
 function adaptCustomFetch(userFetch) {
   return (url, options) => {

@@ -340,16 +340,25 @@ export async function createSolidOidcClient(
     // consumed) stream from baseInit into the per-attempt RequestInit.
     delete (baseInit as { body?: unknown }).body;
 
+    // The effective abort signal (explicit init wins, else the Request's). It is honoured both
+    // while BUFFERING a stream body (so an abort during the read rejects promptly instead of
+    // draining the stream) and is carried into the per-attempt RequestInit via baseInit.
+    const effectiveSignal: AbortSignal | undefined =
+      init && "signal" in init ? (init.signal ?? undefined) : (reqInput?.signal ?? undefined);
+
     // Buffer the body ONCE so it is REPLAYABLE across the original + nonce-retry attempts — a
     // non-replayable stream (a `Request` body, or a `ReadableStream` passed via init.body) would
     // otherwise be consumed by the first attempt and the §8 retry would send an empty/locked body.
     // Precedence matches `fetch`: an explicit `init.body` wins over the Request's body.
     let bufferedBody: BodyInit | undefined;
     if (init && "body" in init) {
-      bufferedBody = await bufferBody((init.body ?? undefined) as BodyInit | null | undefined);
+      bufferedBody = await bufferBody(
+        (init.body ?? undefined) as BodyInit | null | undefined,
+        effectiveSignal,
+      );
     } else if (reqInput && reqInput.body !== null) {
       // A Request body is a stream; read it to an ArrayBuffer so we can send it more than once.
-      bufferedBody = await reqInput.clone().arrayBuffer();
+      bufferedBody = await readBodyWithSignal(reqInput.clone(), effectiveSignal);
     }
 
     // Merge headers from the Request then the init (init overrides), so a Request's content-type
@@ -508,20 +517,69 @@ function requestTransportFields(req: Request): RequestInit {
 }
 
 /**
- * Buffer a body into a REPLAYABLE form. A `ReadableStream` (or a `Request`/`Response`) is read
- * once into an `ArrayBuffer` so it can be sent on both the original attempt and the §8 nonce
- * retry; all other `BodyInit` values (string / `Uint8Array` / `Blob` / `URLSearchParams` /
- * `FormData` / `ArrayBuffer`) are already replayable and pass through unchanged. `null`/`undefined`
- * → `undefined`.
+ * Buffer a body into a REPLAYABLE form. A `ReadableStream` is read once into an `ArrayBuffer` so
+ * it can be sent on both the original attempt and the §8 nonce retry; all other `BodyInit` values
+ * (string / `Uint8Array` / `Blob` / `URLSearchParams` / `FormData` / `ArrayBuffer`) are already
+ * replayable and pass through unchanged. `null`/`undefined` → `undefined`. An `AbortSignal`, when
+ * supplied, aborts an in-flight stream read promptly (matching `fetch` abort semantics).
  */
-async function bufferBody(body: BodyInit | null | undefined): Promise<BodyInit | undefined> {
+async function bufferBody(
+  body: BodyInit | null | undefined,
+  signal: AbortSignal | undefined,
+): Promise<BodyInit | undefined> {
   if (body === null || body === undefined) {
     return undefined;
   }
   if (body instanceof ReadableStream) {
-    return new Response(body).arrayBuffer();
+    return readBodyWithSignal(new Response(body), signal);
   }
   return body;
+}
+
+/**
+ * Read a `Response`/`Request`'s body to an `ArrayBuffer`, racing the read against an optional
+ * `AbortSignal` so an aborted request rejects promptly (with the signal's reason / an
+ * `AbortError`) instead of draining a slow or unbounded stream. If already aborted, rejects
+ * immediately and cancels the underlying stream.
+ */
+async function readBodyWithSignal(
+  body: Body,
+  signal: AbortSignal | undefined,
+): Promise<ArrayBuffer> {
+  if (signal === undefined) {
+    return body.arrayBuffer();
+  }
+  if (signal.aborted) {
+    // Cancel the body stream so it is not left dangling, then reject.
+    void body.body?.cancel().catch(() => {});
+    throw abortReason(signal);
+  }
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const onAbort = () => {
+      void body.body?.cancel().catch(() => {});
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    body.arrayBuffer().then(
+      (buf) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(buf);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+/** The abort reason if the signal supplies one, else a standard `AbortError`. */
+function abortReason(signal: AbortSignal): unknown {
+  const reason = (signal as { reason?: unknown }).reason;
+  if (reason !== undefined) {
+    return reason;
+  }
+  return new DOMException("The operation was aborted.", "AbortError");
 }
 
 /**
