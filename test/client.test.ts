@@ -201,6 +201,20 @@ describe("authorizationUrl — PKCE / state / nonce ALWAYS present", () => {
     expect(url).not.toContain(state.codeVerifier);
   });
 
+  // Regression (roborev Medium, whole-tree-8): the auth request binds the code to the DPoP key via
+  // dpop_jkt (RFC 9449 §10) = the keypair thumbprint (== the token jkt).
+  it("includes dpop_jkt bound to the DPoP keypair thumbprint", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url } = await client.authorizationUrl();
+    expect(new URL(url).searchParams.get("dpop_jkt")).toBe(client.dpopKeyPair.thumbprint);
+  });
+
   it("generates a fresh verifier/state/nonce on each call", async () => {
     const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
     const client = await createSolidOidcClient({
@@ -237,6 +251,7 @@ describe("authorizationUrl — PKCE / state / nonce ALWAYS present", () => {
     "response_type",
     "redirect_uri",
     "client_id",
+    "dpop_jkt",
   ])("REJECTS an extraParams attempt to override the reserved param %s", async (reserved) => {
     const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
     const client = await createSolidOidcClient({

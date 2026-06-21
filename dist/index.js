@@ -76,7 +76,8 @@ var RESERVED_AUTH_PARAMS = /* @__PURE__ */ new Set([
   "code_challenge",
   "code_challenge_method",
   "state",
-  "nonce"
+  "nonce",
+  "dpop_jkt"
 ]);
 function normalizeScope(scope) {
   if (scope === void 0 || scope.trim() === "") {
@@ -356,6 +357,8 @@ async function createSolidOidcClient(opts) {
     if (res.status === 401) {
       const serverNonce = res.headers.get("dpop-nonce");
       if (serverNonce) {
+        await res.body?.cancel().catch(() => {
+        });
         return doFetch(serverNonce);
       }
     }
@@ -388,7 +391,8 @@ async function createSolidOidcClient(opts) {
         code_challenge: codeChallenge,
         code_challenge_method: "S256",
         state,
-        nonce
+        nonce,
+        dpop_jkt: dpopKeyPair.thumbprint
       };
       const url = oidc.buildAuthorizationUrl(config, params);
       return {

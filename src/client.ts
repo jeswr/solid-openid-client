@@ -57,6 +57,7 @@ const RESERVED_AUTH_PARAMS = new Set([
   "code_challenge_method",
   "state",
   "nonce",
+  "dpop_jkt",
 ]);
 
 /**
@@ -587,6 +588,9 @@ export async function createSolidOidcClient(
     if (res.status === 401) {
       const serverNonce = res.headers.get("dpop-nonce");
       if (serverNonce) {
+        // Drain the challenge response body before retrying so its connection/body resources are
+        // released (we discard it — only the retry's response is returned). Best-effort.
+        await res.body?.cancel().catch(() => {});
         return doFetch(serverNonce);
       }
     }
@@ -622,6 +626,9 @@ export async function createSolidOidcClient(
 
       // extraParams spread FIRST so the generated security params always win even if the reserved
       // guard above is ever bypassed (defense-in-depth).
+      // `dpop_jkt` binds the authorization CODE to our DPoP key (RFC 9449 §10): the thumbprint is
+      // the suite keypair's (== the token `jkt`), so an OP that supports code binding ties the code
+      // to the same key the token endpoint proves possession of. A roborev hardening finding.
       const params: Record<string, string> = {
         ...(extraParams ?? {}),
         redirect_uri: redirectUri,
@@ -631,6 +638,7 @@ export async function createSolidOidcClient(
         code_challenge_method: "S256",
         state,
         nonce,
+        dpop_jkt: dpopKeyPair.thumbprint,
       };
       const url = oidc.buildAuthorizationUrl(config, params);
       return {
