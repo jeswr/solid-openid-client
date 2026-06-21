@@ -1,0 +1,75 @@
+{
+  "name": "@jeswr/solid-openid-client",
+  "version": "0.1.0",
+  "description": "Solid-OIDC engine wrapping panva's openid-client v6 — issuer discovery + authorization-code/PKCE + DPoP-bound tokens + refresh + a DPoP-attaching authed fetch, composing @jeswr/solid-dpop for RFC 9449 proofs. For Node/server apps (CLIs, services, bots, agents).",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jesse Wright",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jeswr/solid-openid-client.git"
+  },
+  "homepage": "https://github.com/jeswr/solid-openid-client#readme",
+  "bugs": {
+    "url": "https://github.com/jeswr/solid-openid-client/issues"
+  },
+  "keywords": [
+    "solid",
+    "solid-oidc",
+    "openid-client",
+    "oidc",
+    "dpop",
+    "rfc9449",
+    "oauth",
+    "pkce",
+    "authorization-code",
+    "client-id-document"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build-dist.mjs",
+    "check:dist": "node scripts/check-dist-fresh.mjs",
+    "check:lockfile-transport": "node scripts/check-lockfile-transport.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check src test scripts && npm run check:lockfile-transport",
+    "lint:fix": "biome check --write src test scripts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "gate": "npm run lint && npm run typecheck && npm run test && npm run build && npm run check:dist",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "openid-client": "^6.0.0"
+  },
+  "dependencies": {
+    "@jeswr/solid-dpop": "github:jeswr/solid-dpop#main"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.16",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "openid-client": "^6.8.4",
+    "typescript": "^5.6.0",
+    "vitest": "^4.0.0"
+  }
+}

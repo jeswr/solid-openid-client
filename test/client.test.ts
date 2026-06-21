@@ -1,0 +1,473 @@
+// AUTHORED-BY Claude Opus 4.8 (Fable unavailable) — re-review/upgrade candidate
+/**
+ * Exhaustive tests for the Solid-OIDC engine against a FAITHFUL mock OP (no live IdP, no network,
+ * no ports). The mock signs real ES256 ID tokens, serves a real JWKS, and verifies PKCE S256, so
+ * `openid-client` genuinely validates / rejects — the tests are non-vacuous.
+ *
+ * Coverage (per the security spec):
+ *   - happy path: code → DPoP-bound tokens → webid (from the ID token)
+ *   - webid read from the access token when absent from the ID token
+ *   - PKCE verifier mismatch fails
+ *   - state mismatch fails
+ *   - nonce mismatch fails (ID-token binding)
+ *   - missing-webid-claim fails (fail-closed)
+ *   - opaque access token with no ID-token webid fails (fail-closed)
+ *   - refresh round-trips a NEW DPoP-bound access token (+ rotated refresh token)
+ *   - the authed fetch attaches a valid DPoP proof bound to the access token (ath)
+ *   - the authed fetch retries on the §8 DPoP-Nonce challenge
+ *   - http issuer rejected unless allowInsecure; both-client-forms / no-client errors
+ *   - the token-endpoint request carried a DPoP proof (sender-constrained)
+ */
+
+import { describe, expect, it } from "vitest";
+import { createSolidOidcClient } from "../src/index.js";
+import { createMockOp, expectedAth, jwkThumbprint, verifyWithOpKey } from "./mockOp.js";
+
+const ISSUER = "https://op.example/";
+const CLIENT_ID = "https://app.example/client-id.jsonld";
+const REDIRECT_URI = "https://app.example/callback";
+const WEBID = "https://alice.example/profile/card#me";
+
+/** Drive a full login against a mock OP, returning the client + session + op handle. */
+async function login(
+  opOverrides: Parameters<typeof createMockOp>[0] | undefined = undefined,
+  clientOverrides: Partial<Parameters<typeof createSolidOidcClient>[0]> = {},
+) {
+  const op = await createMockOp({
+    issuer: ISSUER,
+    clientId: CLIENT_ID,
+    webId: WEBID,
+    ...opOverrides,
+  });
+  const client = await createSolidOidcClient({
+    issuer: ISSUER,
+    clientId: CLIENT_ID,
+    redirectUri: REDIRECT_URI,
+    fetch: op.fetch,
+    ...clientOverrides,
+  });
+  const { url, state } = await client.authorizationUrl();
+  const { code, state: returnedState } = op.authorize(url);
+  const callbackUrl = `${REDIRECT_URI}?code=${encodeURIComponent(code)}&state=${encodeURIComponent(returnedState)}`;
+  const session = await client.handleCallback({ url: callbackUrl }, state);
+  return { op, client, session, url, state, code };
+}
+
+describe("createSolidOidcClient — construction guards", () => {
+  it("rejects an http issuer without allowInsecure", async () => {
+    await expect(
+      createSolidOidcClient({
+        issuer: "http://op.example/",
+        clientId: CLIENT_ID,
+        redirectUri: REDIRECT_URI,
+      }),
+    ).rejects.toThrow(/insecure issuer/i);
+  });
+
+  it("rejects a non-loopback http issuer even with allowInsecure", async () => {
+    await expect(
+      createSolidOidcClient({
+        issuer: "http://op.example/",
+        clientId: CLIENT_ID,
+        redirectUri: REDIRECT_URI,
+        allowInsecure: true,
+      }),
+    ).rejects.toThrow(/insecure issuer/i);
+  });
+
+  it("rejects supplying BOTH clientId and client", async () => {
+    await expect(
+      createSolidOidcClient({
+        issuer: ISSUER,
+        clientId: CLIENT_ID,
+        client: { clientId: CLIENT_ID },
+        redirectUri: REDIRECT_URI,
+      }),
+    ).rejects.toThrow(/EITHER/i);
+  });
+
+  it("rejects supplying NO client identity", async () => {
+    await expect(
+      createSolidOidcClient({
+        issuer: ISSUER,
+        redirectUri: REDIRECT_URI,
+      } as Parameters<typeof createSolidOidcClient>[0]),
+    ).rejects.toThrow(/client identity is required/i);
+  });
+});
+
+describe("authorizationUrl — PKCE / state / nonce ALWAYS present", () => {
+  it("includes S256 PKCE, response_type=code, state, nonce, and the requested scopes", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const u = new URL(url);
+    expect(u.searchParams.get("response_type")).toBe("code");
+    expect(u.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(u.searchParams.get("code_challenge")).toBeTruthy();
+    expect(u.searchParams.get("state")).toBe(state.state);
+    expect(u.searchParams.get("nonce")).toBe(state.nonce);
+    expect(u.searchParams.get("client_id")).toBe(CLIENT_ID);
+    expect(u.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
+    const scope = u.searchParams.get("scope") ?? "";
+    expect(scope.split(" ")).toEqual(expect.arrayContaining(["openid", "webid", "offline_access"]));
+    // PKCE verifier is kept client-side, NEVER on the URL.
+    expect(url).not.toContain(state.codeVerifier);
+  });
+
+  it("generates a fresh verifier/state/nonce on each call", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const a = await client.authorizationUrl();
+    const b = await client.authorizationUrl();
+    expect(a.state.codeVerifier).not.toBe(b.state.codeVerifier);
+    expect(a.state.state).not.toBe(b.state.state);
+    expect(a.state.nonce).not.toBe(b.state.nonce);
+  });
+});
+
+describe("handleCallback — happy path", () => {
+  it("exchanges the code for DPoP-bound tokens and reads the webid from the ID token", async () => {
+    const { session } = await login();
+    expect(session.webId).toBe(WEBID);
+    expect(session.issuer).toBe(ISSUER);
+    // openid-client (oauth4webapi) lowercases token_type per the case-insensitive RFC rule.
+    expect(session.tokens.tokenType.toLowerCase()).toBe("dpop");
+    expect(session.tokens.accessToken).toBeTruthy();
+    expect(session.tokens.refreshToken).toMatch(/^refresh-/);
+    expect(session.tokens.idToken).toBeTruthy();
+  });
+
+  it("the returned ID token is genuinely OP-signed and carries iss/aud/webid", async () => {
+    const { op, session } = await login();
+    // Verify the ID token against the OP's REAL public key — proving the engine accepted a
+    // properly-signed token and our test is not vacuous.
+    const claims = await verifyWithOpKey(session.tokens.idToken as string, op.opPublicJwk);
+    expect(claims["iss"]).toBe(ISSUER);
+    expect(claims["aud"]).toBe(CLIENT_ID);
+    expect(claims["webid"]).toBe(WEBID);
+  });
+
+  it("sent a DPoP proof to the token endpoint (sender-constrained exchange)", async () => {
+    const { op } = await login();
+    const tokenReq = op.captured.find((r) => r.url.endsWith("/token") && r.method === "POST");
+    expect(tokenReq).toBeDefined();
+    expect(tokenReq?.headers.dpop).toBeTruthy();
+    // the proof header is a dpop+jwt
+    const dpop = tokenReq?.headers.dpop as string;
+    const header = JSON.parse(Buffer.from(dpop.split(".")[0] as string, "base64url").toString());
+    expect(header.typ).toBe("dpop+jwt");
+    expect(header.alg).toBe("ES256");
+    expect(header.jwk).toBeDefined();
+  });
+
+  it("reads the webid from the ACCESS token when the ID token omits it", async () => {
+    const { session } = await login({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: undefined, // no webid in the ID token
+      webIdInAccessToken: WEBID, // present in the access token instead
+    });
+    expect(session.webId).toBe(WEBID);
+  });
+
+  it("exposes currentTokens()/currentWebId() after login", async () => {
+    const { client, session } = await login();
+    expect(client.currentWebId()).toBe(session.webId);
+    expect(client.currentTokens()?.accessToken).toBe(session.tokens.accessToken);
+  });
+
+  it("accepts the params form of the callback input", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const session = await client.handleCallback({ params: { code, state: returnedState } }, state);
+    expect(session.webId).toBe(WEBID);
+  });
+});
+
+describe("handleCallback — security: rejections (fail-closed)", () => {
+  it("FAILS on a PKCE verifier mismatch", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    // Tamper the verifier the client will send to the token endpoint.
+    const tampered = { ...state, codeVerifier: `${state.codeVerifier}TAMPERED` };
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=${returnedState}`;
+    await expect(client.handleCallback({ url: callbackUrl }, tampered)).rejects.toThrow();
+  });
+
+  it("FAILS on a state mismatch (CSRF)", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code } = op.authorize(url);
+    // Redirect carries a DIFFERENT state than the one the client expects.
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=attacker-supplied-state`;
+    await expect(client.handleCallback({ url: callbackUrl }, state)).rejects.toThrow();
+  });
+
+  it("FAILS on a nonce mismatch (ID-token binding)", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    // The OP minted an ID token bound to the REAL nonce; tell handleCallback to expect a
+    // different one → the ID-token nonce check must fail.
+    const tampered = { ...state, nonce: "a-different-nonce" };
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=${returnedState}`;
+    await expect(client.handleCallback({ url: callbackUrl }, tampered)).rejects.toThrow();
+  });
+
+  it("FAILS fail-closed when no webid is present in either token", async () => {
+    const op = await createMockOp({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: undefined, // no webid in the ID token
+      // and none in the access token
+    });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=${returnedState}`;
+    await expect(client.handleCallback({ url: callbackUrl }, state)).rejects.toThrow(/webid/i);
+  });
+
+  it("FAILS fail-closed with an opaque access token and no ID-token webid", async () => {
+    const op = await createMockOp({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: undefined,
+      opaqueAccessToken: true,
+    });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=${returnedState}`;
+    await expect(client.handleCallback({ url: callbackUrl }, state)).rejects.toThrow(/webid/i);
+  });
+
+  it("FAILS fail-closed when the webid claim is not an http(s) IRI", async () => {
+    const op = await createMockOp({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: "urn:not-a-web-id",
+    });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=${returnedState}`;
+    await expect(client.handleCallback({ url: callbackUrl }, state)).rejects.toThrow(/webid/i);
+  });
+});
+
+describe("refresh", () => {
+  it("round-trips a NEW DPoP-bound access token and a rotated refresh token", async () => {
+    const { client, session } = await login();
+    const firstAccess = session.tokens.accessToken;
+    const firstRefresh = session.tokens.refreshToken as string;
+
+    const refreshed = await client.refresh();
+    expect(refreshed.accessToken).not.toBe(firstAccess); // genuinely new token
+    expect(refreshed.tokenType.toLowerCase()).toBe("dpop");
+    expect(refreshed.refreshToken).toBeTruthy();
+    expect(refreshed.refreshToken).not.toBe(firstRefresh); // rotated
+    // client state updated
+    expect(client.currentTokens()?.accessToken).toBe(refreshed.accessToken);
+  });
+
+  it("sent a DPoP proof to the token endpoint on refresh (sender-constrained)", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0; // clear, then refresh
+    await client.refresh();
+    const refreshReq = op.captured.find(
+      (r) => r.url.endsWith("/token") && (r.body ?? "").includes("grant_type=refresh_token"),
+    );
+    expect(refreshReq).toBeDefined();
+    expect(refreshReq?.headers.dpop).toBeTruthy();
+  });
+
+  it("THROWS when no refresh token is available", async () => {
+    const { client } = await login({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: WEBID,
+      grantRefreshToken: false,
+    });
+    await expect(client.refresh()).rejects.toThrow(/refresh token/i);
+  });
+
+  it("refreshes with an explicitly supplied refresh token", async () => {
+    const { client, session } = await login();
+    const refreshed = await client.refresh(session.tokens.refreshToken);
+    expect(refreshed.accessToken).toBeTruthy();
+  });
+});
+
+describe("the authed fetch — DPoP proof bound to the access token (ath)", () => {
+  it("attaches a DPoP proof whose ath is SHA-256(access_token) and jkt matches the keypair", async () => {
+    const { op, client, session } = await login();
+    const res = await client.fetch("https://op.example/resource/doc.ttl");
+    expect(res.status).toBe(200);
+
+    const proof = op.lastResourceDpop();
+    expect(proof).toBeDefined();
+    // header: dpop+jwt with the embedded public jwk
+    expect(proof?.header.typ).toBe("dpop+jwt");
+    expect(proof?.header.alg).toBe("ES256");
+    expect(proof?.header.jwk).toBeDefined();
+    // payload: htm/htu + ath bound to THIS access token
+    expect(proof?.payload.htm).toBe("GET");
+    expect(proof?.payload.htu).toBe("https://op.example/resource/doc.ttl");
+    expect(proof?.payload.ath).toBe(expectedAth(session.tokens.accessToken));
+    expect(proof?.payload.jti).toBeTruthy();
+
+    // the proof's embedded jwk thumbprint equals the keypair the tokens are bound to (jkt)
+    const embeddedJwk = proof?.header.jwk as Record<string, unknown>;
+    const thumbprint = await jwkThumbprint(embeddedJwk);
+    expect(thumbprint).toBe(client.dpopKeyPair.thumbprint);
+
+    // the Authorization header carried the DPoP-scheme access token
+    const resourceReq = op.captured.find((r) => r.url.includes("/resource/"));
+    expect(resourceReq?.headers.authorization).toBe(`DPoP ${session.tokens.accessToken}`);
+  });
+
+  it("strips query/fragment from htu", async () => {
+    const { op, client } = await login();
+    await client.fetch("https://op.example/resource/doc.ttl?foo=bar#frag");
+    const proof = op.lastResourceDpop();
+    expect(proof?.payload.htu).toBe("https://op.example/resource/doc.ttl");
+  });
+
+  it("uses the request method in htm", async () => {
+    const { op, client } = await login();
+    await client.fetch("https://op.example/resource/doc.ttl", { method: "PUT", body: "x" });
+    const proof = op.lastResourceDpop();
+    expect(proof?.payload.htm).toBe("PUT");
+  });
+
+  it("mints a FRESH jti per request (proofs are single-use)", async () => {
+    const { op, client } = await login();
+    await client.fetch("https://op.example/resource/a.ttl");
+    const first = op.lastResourceDpop()?.payload.jti;
+    await client.fetch("https://op.example/resource/b.ttl");
+    const second = op.lastResourceDpop()?.payload.jti;
+    expect(first).toBeTruthy();
+    expect(second).toBeTruthy();
+    expect(first).not.toBe(second);
+  });
+
+  it("retries once on a §8 DPoP-Nonce challenge, echoing the nonce", async () => {
+    const { op, client } = await login();
+    op.challengeNextResourceWithNonce("server-nonce-xyz");
+    const res = await client.fetch("https://op.example/resource/doc.ttl");
+    // second attempt succeeded
+    expect(res.status).toBe(200);
+    // the retried proof carried the server nonce
+    const proof = op.lastResourceDpop();
+    expect(proof?.payload.nonce).toBe("server-nonce-xyz");
+  });
+
+  it("THROWS if called before any token is available", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    await expect(client.fetch("https://op.example/resource/doc.ttl")).rejects.toThrow(
+      /no access token/i,
+    );
+  });
+
+  it("binds the proof to the REFRESHED access token after a refresh", async () => {
+    const { op, client } = await login();
+    const refreshed = await client.refresh();
+    await client.fetch("https://op.example/resource/doc.ttl");
+    const proof = op.lastResourceDpop();
+    expect(proof?.payload.ath).toBe(expectedAth(refreshed.accessToken));
+  });
+});
+
+describe("scope handling", () => {
+  it("forces openid into a custom scope and de-dups", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+      scope: "webid webid offline_access",
+    });
+    const { url } = await client.authorizationUrl();
+    const scope = new URL(url).searchParams.get("scope") ?? "";
+    const parts = scope.split(" ");
+    expect(parts[0]).toBe("openid");
+    expect(parts.filter((p) => p === "webid")).toHaveLength(1);
+  });
+});
+
+describe("DPoP keypair reuse (persisted-session restart)", () => {
+  it("reuses a supplied keypair so the jkt is stable across client instances", async () => {
+    const { client: first, op } = await login();
+    const keyPair = first.dpopKeyPair;
+
+    // A second client created with the SAME keypair (e.g. a restored session) has the same jkt.
+    const second = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+      dpopKeyPair: keyPair,
+    });
+    expect(second.dpopKeyPair.thumbprint).toBe(first.dpopKeyPair.thumbprint);
+  });
+});
