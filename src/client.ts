@@ -270,9 +270,9 @@ function resolveUrl(input: string | URL): string {
  * `sub` is itself the WebID); both are read here from the verified ID token. If neither yields an
  * `http(s)` WebID, we THROW — a session is never returned without a verified, resolvable WebID.
  */
-function extractWebId(
+function extractWebIdOrUndefined(
   tokenResponse: oidc.TokenEndpointResponse & oidc.TokenEndpointResponseHelpers,
-): string {
+): string | undefined {
   // Verified ID-token claims ONLY — signature + iss/aud/nonce already checked by openid-client.
   const idClaims = tokenResponse.claims();
 
@@ -289,6 +289,17 @@ function extractWebId(
     return fromSub;
   }
 
+  return undefined;
+}
+
+/** {@link extractWebIdOrUndefined}, but THROWS fail-closed when no verified WebID is present. */
+function extractWebId(
+  tokenResponse: oidc.TokenEndpointResponse & oidc.TokenEndpointResponseHelpers,
+): string {
+  const webId = extractWebIdOrUndefined(tokenResponse);
+  if (webId !== undefined) {
+    return webId;
+  }
   throw new Error(
     "Solid-OIDC login produced no resolvable `webid` claim in the VERIFIED ID token; refusing to " +
       "return a session without a verified WebID (fail-closed). The WebID is never trusted from an " +
@@ -676,6 +687,12 @@ export async function createSolidOidcClient(
           "refresh: no refresh token available — supply one or log in with `offline_access` first.",
         );
       }
+      // Is this a refresh of the CURRENT session (same identity guaranteed) or with an EXPLICIT,
+      // possibly-different token? An explicit token may belong to a different identity, so we must
+      // not keep the prior `currentWebId` unless the refreshed ID token re-proves an identity.
+      const sameSession =
+        refreshTokenArg === undefined || refreshTokenArg === currentTokens?.refreshToken;
+
       const res = await oidc.refreshTokenGrant(config, refreshToken, undefined, {
         DPoP: dpopHandle,
       });
@@ -687,11 +704,18 @@ export async function createSolidOidcClient(
         tokens = { ...tokens, refreshToken };
       }
       currentTokens = tokens;
-      // A refresh response may carry an updated ID token with the webid; keep currentWebId fresh
-      // when one is present, but never clobber a known WebID with nothing.
-      const refreshedWebId = res.claims()?.webid;
-      if (typeof refreshedWebId === "string" && isHttpUri(refreshedWebId)) {
+
+      // Re-derive the WebID from the refreshed VERIFIED ID token (same rules as login: `webid`
+      // claim or `sub`). If the response carries one, adopt it. If it does NOT:
+      //   - same-session refresh: keep the known WebID (identity is unchanged).
+      //   - explicit (possibly different) token: CLEAR currentWebId — we must not report a stale
+      //     identity that may not match the freshly-refreshed tokens (fail-closed; a roborev
+      //     finding). Read currentWebId() again after re-login if you need it.
+      const refreshedWebId = extractWebIdOrUndefined(res);
+      if (refreshedWebId !== undefined) {
         currentWebId = refreshedWebId;
+      } else if (!sameSession) {
+        currentWebId = undefined;
       }
       return tokens;
     },

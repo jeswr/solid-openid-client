@@ -567,6 +567,37 @@ describe("refresh", () => {
     expect(refreshed.accessToken).toBeTruthy();
   });
 
+  // Regression (roborev Medium, whole-tree-9): refreshing with an EXPLICIT, DIFFERENT token whose
+  // response carries no verified WebID must CLEAR currentWebId — never report a stale identity that
+  // may not match the refreshed tokens.
+  it("clears currentWebId on an explicit (different) refresh whose response proves no identity", async () => {
+    const { client } = await login({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: WEBID,
+      omitWebIdOnRefresh: true, // the refresh ID token has no webid
+    });
+    expect(client.currentWebId()).toBe(WEBID);
+    // Refresh with an EXPLICIT token DIFFERENT from the current one (the mock accepts any
+    // `refresh-`-prefixed token) — treated as a possibly-different identity.
+    await client.refresh("refresh-some-other-token-1");
+    // No verified WebID in the refresh response → the stale identity is cleared (fail-closed).
+    expect(client.currentWebId()).toBeUndefined();
+  });
+
+  // A SAME-SESSION refresh (no explicit arg) keeps the known WebID even if the response omits it.
+  it("keeps currentWebId on a same-session refresh that omits the webid", async () => {
+    const { client } = await login({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: WEBID,
+      omitWebIdOnRefresh: true,
+    });
+    expect(client.currentWebId()).toBe(WEBID);
+    await client.refresh(); // same session, no explicit token
+    expect(client.currentWebId()).toBe(WEBID);
+  });
+
   // Regression (roborev Medium, whole-tree): a non-rotating OP omits refresh_token on refresh;
   // the client must carry the prior refresh token forward so a SECOND refresh still works.
   it("carries the prior refresh token forward when the OP does not rotate it", async () => {

@@ -196,7 +196,7 @@ function resolveUrl(input) {
     );
   }
 }
-function extractWebId(tokenResponse) {
+function extractWebIdOrUndefined(tokenResponse) {
   const idClaims = tokenResponse.claims();
   const fromWebidClaim = idClaims?.webid;
   if (typeof fromWebidClaim === "string" && isHttpUri(fromWebidClaim)) {
@@ -205,6 +205,13 @@ function extractWebId(tokenResponse) {
   const fromSub = idClaims?.sub;
   if (typeof fromSub === "string" && isHttpUri(fromSub)) {
     return fromSub;
+  }
+  return void 0;
+}
+function extractWebId(tokenResponse) {
+  const webId = extractWebIdOrUndefined(tokenResponse);
+  if (webId !== void 0) {
+    return webId;
   }
   throw new Error(
     "Solid-OIDC login produced no resolvable `webid` claim in the VERIFIED ID token; refusing to return a session without a verified WebID (fail-closed). The WebID is never trusted from an unverified access token."
@@ -430,6 +437,7 @@ async function createSolidOidcClient(opts) {
           "refresh: no refresh token available \u2014 supply one or log in with `offline_access` first."
         );
       }
+      const sameSession = refreshTokenArg === void 0 || refreshTokenArg === currentTokens?.refreshToken;
       const res = await oidc.refreshTokenGrant(config, refreshToken, void 0, {
         DPoP: dpopHandle
       });
@@ -438,9 +446,11 @@ async function createSolidOidcClient(opts) {
         tokens = { ...tokens, refreshToken };
       }
       currentTokens = tokens;
-      const refreshedWebId = res.claims()?.webid;
-      if (typeof refreshedWebId === "string" && isHttpUri(refreshedWebId)) {
+      const refreshedWebId = extractWebIdOrUndefined(res);
+      if (refreshedWebId !== void 0) {
         currentWebId = refreshedWebId;
+      } else if (!sameSession) {
+        currentWebId = void 0;
       }
       return tokens;
     }

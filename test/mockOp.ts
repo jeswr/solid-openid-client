@@ -63,6 +63,11 @@ export interface MockOpOptions {
    * must reject a bearer token for a DPoP-bound flow.
    */
   readonly tokenTypeOverride?: string;
+  /**
+   * Omit the `webid` from the REFRESH-response ID token (login still carries it) — to test that an
+   * explicit cross-identity refresh clears the stale `currentWebId`.
+   */
+  readonly omitWebIdOnRefresh?: boolean;
 }
 
 export interface MockOp {
@@ -257,8 +262,12 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
       if (!refresh?.startsWith("refresh-")) {
         return json({ error: "invalid_grant", error_description: "unknown refresh token" }, 400);
       }
-      // A refreshed ID token carries the same webid; nonce is not required on refresh.
-      const idToken = opts.omitIdToken ? undefined : await mintIdTokenNoNonce(opts.webId);
+      // A refreshed ID token carries the same webid; nonce is not required on refresh. When
+      // `omitWebIdOnRefresh` is set, the refresh ID token has NO webid (to test that the client
+      // clears a stale identity on an explicit cross-identity refresh).
+      const idToken = opts.omitIdToken
+        ? undefined
+        : await mintIdTokenNoNonce(opts.omitWebIdOnRefresh ? undefined : opts.webId);
       const accessToken = await mintAccessToken();
       // A non-rotating OP omits refresh_token from a refresh response.
       const rotate = opts.rotateRefreshTokenOnRefresh !== false;
