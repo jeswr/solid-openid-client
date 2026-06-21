@@ -128,9 +128,18 @@ export interface CreateSolidOidcClientOptions {
      */
     readonly fetch?: FetchLike;
     /**
-     * Allow `http:` (non-TLS) issuer/endpoint URLs. OFF by default (Solid-OIDC requires TLS). Only
-     * enable for a local dev OP on loopback. When false, an `http:` issuer is rejected.
+     * Allow `http:` (non-TLS) issuer/endpoint/resource URLs. OFF by default (Solid-OIDC requires
+     * TLS). Only enable for a local dev OP / pod on loopback. When false, an `http:` issuer AND any
+     * `http:` resource URL the authed `fetch` is asked to hit are rejected (so the DPoP token is
+     * never sent over plaintext).
      */
     readonly allowInsecure?: boolean;
+    /**
+     * Cap (bytes) on a STREAM request body the authed `fetch` buffers for the §8 DPoP-nonce retry.
+     * A stream body larger than this is rejected rather than buffered (memory-safety). Defaults to
+     * 10 MiB. Non-stream bodies (string / Uint8Array / Blob / …) are already replayable and not
+     * buffered, so the cap does not apply to them.
+     */
+    readonly maxReplayBodyBytes?: number;
 }
 //# sourceMappingURL=types.d.ts.map

@@ -37,6 +37,13 @@ import type {
 export const DEFAULT_SCOPE = "openid webid offline_access";
 
 /**
+ * Default cap (bytes) on a STREAM request body buffered for §8 nonce-retry replay. A stream body
+ * larger than this is rejected rather than buffered (so an upload cannot exhaust memory). 10 MiB —
+ * generous for typical Solid resource writes; raise via `maxReplayBodyBytes` for larger uploads.
+ */
+export const DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
+
+/**
  * Authorization-request parameters the engine OWNS — a caller's `extraParams` must not override
  * these, because the package's PKCE / state / nonce / scope guarantees depend on them. An attempt
  * to set any of these via `extraParams` is rejected.
@@ -96,33 +103,62 @@ function hasSecret(id: ClientIdentity): id is ClientIdentity & { clientSecret: s
 }
 
 /**
- * Assert an issuer URL is https (or http-on-loopback only when `allowInsecure`). Mirrors the
- * RFC 8252 §8.3 / OAuth-BCP transport rule the suite uses elsewhere.
+ * True iff `hostname` (as returned by `URL.hostname`) is a loopback host. Handles `localhost`, the
+ * whole `127.0.0.0/8` IPv4 loopback range, and IPv6 `::1` — including Node's BRACKETED IPv6 form
+ * (`URL.hostname` returns `[::1]` with brackets, so a bare `=== "::1"` check would miss it).
  */
-function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === "localhost") {
+    return true;
+  }
+  // IPv6 loopback — strip the brackets URL.hostname adds, then compare. `::1` and its expanded
+  // forms all normalise to `::1` via URL parsing, but compare defensively.
+  const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (unbracketed === "::1") {
+    return true;
+  }
+  // IPv4 127.0.0.0/8.
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(unbracketed)) {
+    const octets = unbracketed.split(".").map(Number);
+    return octets.every((o) => o >= 0 && o <= 255);
+  }
+  return false;
+}
+
+/**
+ * Assert a URL is https (or http-on-loopback only when `allowInsecure`). Mirrors the RFC 8252
+ * §8.3 / OAuth-BCP transport rule the suite uses elsewhere. `label`/`makeError` shape the message.
+ */
+function assertSecureTransport(
+  rawUrl: string,
+  allowInsecure: boolean,
+  makeError: (msg: string) => Error,
+): void {
   let u: URL;
   try {
-    u = new URL(issuer);
+    u = new URL(rawUrl);
   } catch {
-    throw new Error(`createSolidOidcClient: \`issuer\` is not a valid URL: ${issuer}`);
+    throw makeError(`not a valid URL: ${rawUrl}`);
   }
   if (u.protocol === "https:") {
     return;
   }
   if (u.protocol === "http:") {
-    const host = u.hostname;
-    const isLoopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
-    if (allowInsecure && isLoopback) {
+    if (allowInsecure && isLoopbackHost(u.hostname)) {
       return;
     }
-    throw new Error(
-      `createSolidOidcClient: refusing an insecure issuer (${issuer}). Solid-OIDC requires https; ` +
-        "http: is permitted only for a loopback dev OP with `allowInsecure: true`.",
+    throw makeError(
+      `refusing an insecure http: URL (${rawUrl}). https is required; http: is permitted only for a ` +
+        "loopback host with `allowInsecure: true`.",
     );
   }
-  throw new Error(
-    `createSolidOidcClient: unsupported issuer scheme in ${issuer} (expected https:).`,
-  );
+  throw makeError(`unsupported URL scheme in ${rawUrl} (expected https:).`);
+}
+
+/** Assert an issuer URL is https (or http-on-loopback only when `allowInsecure`). */
+function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
+  assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
 }
 
 /**
@@ -246,6 +282,7 @@ export async function createSolidOidcClient(
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
+  const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   // The consumer's DOM-shaped fetch (test seam / SSRF-guarded fetch in prod). Used directly for
   // the resource-leg authed fetch, and adapted to openid-client's `CustomFetch` for discovery /
   // token requests.
@@ -323,6 +360,15 @@ export async function createSolidOidcClient(
     const reqInput = input instanceof Request ? input : undefined;
     const url = reqInput ? reqInput.url : input.toString();
 
+    // SECURITY: never attach the DPoP access token + proof to a plaintext URL — that would leak the
+    // bearer-class token over the wire. Require https (http only on loopback when allowInsecure),
+    // BEFORE building any header/proof (a roborev finding).
+    assertSecureTransport(
+      url,
+      allowInsecure,
+      (msg) => new Error(`authedFetch: ${msg} — refusing to send the DPoP token over plaintext.`),
+    );
+
     // Effective method: explicit init wins, else the Request's, else GET.
     const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
 
@@ -354,13 +400,15 @@ export async function createSolidOidcClient(
       bufferedBody = await bufferBody(
         (init.body ?? undefined) as BodyInit | null | undefined,
         effectiveSignal,
+        maxReplayBodyBytes,
       );
     } else if (reqInput && reqInput.body !== null) {
-      // A Request body is a stream; read it (abort-aware, cancellable) so we can send it more
-      // than once across the original + nonce retry.
+      // A Request body is a stream; read it (abort-aware, cancellable, size-capped) so we can send
+      // it more than once across the original + nonce retry.
       bufferedBody = await readStreamWithSignal(
         reqInput.clone().body as ReadableStream<Uint8Array>,
         effectiveSignal,
+        maxReplayBodyBytes,
       );
     }
 
@@ -554,16 +602,22 @@ function requestTransportFields(req: Request): RequestInit {
  * (string / `Uint8Array` / `Blob` / `URLSearchParams` / `FormData` / `ArrayBuffer`) are already
  * replayable and pass through unchanged. `null`/`undefined` → `undefined`. An `AbortSignal`, when
  * supplied, aborts an in-flight stream read promptly (matching `fetch` abort semantics).
+ *
+ * `maxBytes` caps the buffered size so a large/unbounded stream upload cannot exhaust memory (a
+ * roborev finding): a stream body larger than the cap is REJECTED rather than buffered. To upload a
+ * body larger than the cap, raise `maxReplayBodyBytes` (or pass a non-stream body, which is not
+ * buffered).
  */
 async function bufferBody(
   body: BodyInit | null | undefined,
   signal: AbortSignal | undefined,
+  maxBytes: number,
 ): Promise<BodyInit | undefined> {
   if (body === null || body === undefined) {
     return undefined;
   }
   if (body instanceof ReadableStream) {
-    return readStreamWithSignal(body, signal);
+    return readStreamWithSignal(body, signal, maxBytes);
   }
   return body;
 }
@@ -580,6 +634,7 @@ async function bufferBody(
 async function readStreamWithSignal(
   stream: ReadableStream<Uint8Array>,
   signal: AbortSignal | undefined,
+  maxBytes: number,
 ): Promise<ArrayBuffer> {
   const reader = stream.getReader();
 
@@ -614,8 +669,17 @@ async function readStreamWithSignal(
       if (result.done) {
         break;
       }
-      chunks.push(result.value);
       total += result.value.byteLength;
+      // Bounded buffering: a body larger than the cap is rejected (cancels the reader) rather than
+      // buffered, so a large/unbounded upload cannot exhaust memory.
+      if (total > maxBytes) {
+        throw new Error(
+          `authedFetch: request stream body exceeds the ${maxBytes}-byte replay buffer cap. ` +
+            "Raise `maxReplayBodyBytes` to upload a larger body (it is buffered so the §8 DPoP-nonce " +
+            "retry can replay it).",
+        );
+      }
+      chunks.push(result.value);
     }
   } catch (err) {
     // On abort (or any read error) cancel the reader so the source stops producing, then rethrow.

@@ -67,6 +67,7 @@ function resourceDpopProof(keyPair, method, url, accessToken, nonce) {
 
 // src/client.ts
 var DEFAULT_SCOPE2 = "openid webid offline_access";
+var DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
 var RESERVED_AUTH_PARAMS = /* @__PURE__ */ new Set([
   "client_id",
   "redirect_uri",
@@ -106,29 +107,43 @@ function resolveIdentity(opts) {
 function hasSecret(id) {
   return "clientSecret" in id && typeof id.clientSecret === "string" && id.clientSecret.length > 0;
 }
-function assertIssuerTransport2(issuer, allowInsecure) {
+function isLoopbackHost2(hostname) {
+  const host = hostname.toLowerCase();
+  if (host === "localhost") {
+    return true;
+  }
+  const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (unbracketed === "::1") {
+    return true;
+  }
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(unbracketed)) {
+    const octets = unbracketed.split(".").map(Number);
+    return octets.every((o) => o >= 0 && o <= 255);
+  }
+  return false;
+}
+function assertSecureTransport(rawUrl, allowInsecure, makeError) {
   let u;
   try {
-    u = new URL(issuer);
+    u = new URL(rawUrl);
   } catch {
-    throw new Error(`createSolidOidcClient: \`issuer\` is not a valid URL: ${issuer}`);
+    throw makeError(`not a valid URL: ${rawUrl}`);
   }
   if (u.protocol === "https:") {
     return;
   }
   if (u.protocol === "http:") {
-    const host = u.hostname;
-    const isLoopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
-    if (allowInsecure && isLoopback) {
+    if (allowInsecure && isLoopbackHost2(u.hostname)) {
       return;
     }
-    throw new Error(
-      `createSolidOidcClient: refusing an insecure issuer (${issuer}). Solid-OIDC requires https; http: is permitted only for a loopback dev OP with \`allowInsecure: true\`.`
+    throw makeError(
+      `refusing an insecure http: URL (${rawUrl}). https is required; http: is permitted only for a loopback host with \`allowInsecure: true\`.`
     );
   }
-  throw new Error(
-    `createSolidOidcClient: unsupported issuer scheme in ${issuer} (expected https:).`
-  );
+  throw makeError(`unsupported URL scheme in ${rawUrl} (expected https:).`);
+}
+function assertIssuerTransport2(issuer, allowInsecure) {
+  assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
 }
 function extractWebId(tokenResponse) {
   const idClaims = tokenResponse.claims();
@@ -171,6 +186,7 @@ async function createSolidOidcClient(opts) {
   const identity = resolveIdentity(opts);
   const scope = normalizeScope(opts.scope);
   const redirectUri = opts.redirectUri;
+  const maxReplayBodyBytes = opts.maxReplayBodyBytes ?? DEFAULT_MAX_REPLAY_BODY_BYTES;
   const userFetch = opts.fetch ?? globalThis.fetch;
   const dpopKeyPair = opts.dpopKeyPair ?? await generateDpopKeyPair();
   const baseMetadata = {
@@ -213,6 +229,11 @@ async function createSolidOidcClient(opts) {
     const accessToken = currentTokens.accessToken;
     const reqInput = input instanceof Request ? input : void 0;
     const url = reqInput ? reqInput.url : input.toString();
+    assertSecureTransport(
+      url,
+      allowInsecure,
+      (msg) => new Error(`authedFetch: ${msg} \u2014 refusing to send the DPoP token over plaintext.`)
+    );
     const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
     const baseInit = {
       ...reqInput ? requestTransportFields(reqInput) : {},
@@ -225,12 +246,14 @@ async function createSolidOidcClient(opts) {
     if (init && "body" in init) {
       bufferedBody = await bufferBody(
         init.body ?? void 0,
-        effectiveSignal
+        effectiveSignal,
+        maxReplayBodyBytes
       );
     } else if (reqInput && reqInput.body !== null) {
       bufferedBody = await readStreamWithSignal(
         reqInput.clone().body,
-        effectiveSignal
+        effectiveSignal,
+        maxReplayBodyBytes
       );
     }
     const buildHeaders = (proof) => {
@@ -371,16 +394,16 @@ function requestTransportFields(req) {
     ...req.signal ? { signal: req.signal } : {}
   };
 }
-async function bufferBody(body, signal) {
+async function bufferBody(body, signal, maxBytes) {
   if (body === null || body === void 0) {
     return void 0;
   }
   if (body instanceof ReadableStream) {
-    return readStreamWithSignal(body, signal);
+    return readStreamWithSignal(body, signal, maxBytes);
   }
   return body;
 }
-async function readStreamWithSignal(stream, signal) {
+async function readStreamWithSignal(stream, signal, maxBytes) {
   const reader = stream.getReader();
   let removeAbortListener;
   const abortRace = signal === void 0 ? void 0 : new Promise((_resolve, reject) => {
@@ -401,8 +424,13 @@ async function readStreamWithSignal(stream, signal) {
       if (result.done) {
         break;
       }
-      chunks.push(result.value);
       total += result.value.byteLength;
+      if (total > maxBytes) {
+        throw new Error(
+          `authedFetch: request stream body exceeds the ${maxBytes}-byte replay buffer cap. Raise \`maxReplayBodyBytes\` to upload a larger body (it is buffered so the \xA78 DPoP-nonce retry can replay it).`
+        );
+      }
+      chunks.push(result.value);
     }
   } catch (err) {
     await reader.cancel(err).catch(() => {
@@ -440,6 +468,7 @@ function adaptCustomFetch(userFetch) {
   };
 }
 export {
+  DEFAULT_MAX_REPLAY_BODY_BYTES,
   DEFAULT_SCOPE2 as DEFAULT_SCOPE,
   createSolidOidcClient,
   generateDpopKeyPair,

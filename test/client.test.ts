@@ -61,7 +61,7 @@ describe("createSolidOidcClient — construction guards", () => {
         clientId: CLIENT_ID,
         redirectUri: REDIRECT_URI,
       }),
-    ).rejects.toThrow(/insecure issuer/i);
+    ).rejects.toThrow(/insecure http/i);
   });
 
   it("rejects a non-loopback http issuer even with allowInsecure", async () => {
@@ -72,7 +72,28 @@ describe("createSolidOidcClient — construction guards", () => {
         redirectUri: REDIRECT_URI,
         allowInsecure: true,
       }),
-    ).rejects.toThrow(/insecure issuer/i);
+    ).rejects.toThrow(/insecure http/i);
+  });
+
+  // Regression (roborev Low, whole-tree): IPv6 loopback (URL.hostname → "[::1]") must be accepted
+  // with allowInsecure. The mock OP isn't reachable, but the transport guard must not be what
+  // rejects it — so the failure (if any) is the discovery fetch, not an "insecure" rejection.
+  it.each([
+    "http://127.0.0.1:3000/",
+    "http://[::1]:3000/",
+    "http://localhost:3000/",
+  ])("accepts the loopback issuer %s with allowInsecure (transport guard passes)", async (issuer) => {
+    // Build a mock OP whose discovery answers regardless of the host (it matches on path).
+    const op = await createMockOp({ issuer, clientId: CLIENT_ID, webId: WEBID });
+    // Should NOT throw an "insecure" transport error — it constructs fine over the fake fetch.
+    const client = await createSolidOidcClient({
+      issuer,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+      allowInsecure: true,
+    });
+    expect(client.issuer).toBe(issuer);
   });
 
   it("rejects supplying BOTH clientId and client", async () => {
@@ -686,6 +707,107 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     await client.fetch("https://op.example/resource/doc.ttl");
     const proof = op.lastResourceDpop();
     expect(proof?.payload.ath).toBe(expectedAth(refreshed.accessToken));
+  });
+
+  // Regression (roborev High, whole-tree): never send the DPoP token over plaintext http.
+  it("REFUSES to attach the DPoP token to an http resource URL (no allowInsecure)", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    await expect(client.fetch("http://op.example/resource/doc.ttl")).rejects.toThrow(
+      /insecure http|plaintext/i,
+    );
+    // and it never even reached the network (no DPoP token leaked)
+    expect(op.captured.filter((r) => r.url.includes("/resource/"))).toHaveLength(0);
+  });
+
+  it("allows an http LOOPBACK resource URL when allowInsecure is set", async () => {
+    const op = await createMockOp({
+      issuer: "http://localhost:3000/",
+      clientId: CLIENT_ID,
+      webId: WEBID,
+    });
+    const client = await createSolidOidcClient({
+      issuer: "http://localhost:3000/",
+      clientId: CLIENT_ID,
+      redirectUri: "http://localhost:3000/callback",
+      fetch: op.fetch,
+      allowInsecure: true,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    await client.handleCallback(
+      { url: `http://localhost:3000/callback?code=${code}&state=${returnedState}` },
+      state,
+    );
+    // an http loopback resource is permitted
+    const res = await client.fetch("http://localhost:3000/resource/doc.ttl");
+    expect(res.status).toBe(200);
+  });
+
+  // Regression (roborev Medium, whole-tree): a stream body over the replay cap is rejected, not
+  // buffered (memory-safety). Cap set tiny here to exercise it deterministically.
+  it("REJECTS a stream body larger than the replay-buffer cap", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+      maxReplayBodyBytes: 8, // tiny cap
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    await client.handleCallback(
+      { url: `${REDIRECT_URI}?code=${code}&state=${returnedState}` },
+      state,
+    );
+    const big = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("this body is well over eight bytes"));
+        controller.close();
+      },
+    });
+    await expect(
+      client.fetch("https://op.example/resource/doc.ttl", {
+        method: "PUT",
+        body: big,
+        // @ts-expect-error duplex is not yet in the DOM RequestInit lib types
+        duplex: "half",
+      }),
+    ).rejects.toThrow(/cap|exceeds/i);
+  });
+
+  it("allows a stream body within the cap", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+      maxReplayBodyBytes: 1024,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    await client.handleCallback(
+      { url: `${REDIRECT_URI}?code=${code}&state=${returnedState}` },
+      state,
+    );
+    op.captured.length = 0;
+    const small = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("small"));
+        controller.close();
+      },
+    });
+    const res = await client.fetch("https://op.example/resource/doc.ttl", {
+      method: "PUT",
+      body: small,
+      // @ts-expect-error duplex is not yet in the DOM RequestInit lib types
+      duplex: "half",
+    });
+    expect(res.status).toBe(200);
+    const sent = op.captured.find((r) => r.url.includes("/resource/"));
+    expect(sent?.body).toBe("small");
   });
 });
 

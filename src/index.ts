@@ -14,6 +14,7 @@
 
 export {
   createSolidOidcClient,
+  DEFAULT_MAX_REPLAY_BODY_BYTES,
   DEFAULT_SCOPE,
   type SolidOidcClient,
 } from "./client.js";

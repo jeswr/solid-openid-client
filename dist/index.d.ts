@@ -10,7 +10,7 @@
  * `openid-client` is a PEER dependency (you install + de-dupe your own copy). `@jeswr/solid-dpop`
  * is a normal dependency (bundled into the committed `dist/` for GitHub-branch installs).
  */
-export { createSolidOidcClient, DEFAULT_SCOPE, type SolidOidcClient, } from "./client.js";
+export { createSolidOidcClient, DEFAULT_MAX_REPLAY_BODY_BYTES, DEFAULT_SCOPE, type SolidOidcClient, } from "./client.js";
 export { type CryptoKeyPairLike, type DpopKeyPair, generateDpopKeyPair, resourceDpopProof, toCryptoKeyPair, } from "./dpop.js";
 export type { AuthorizationRequest, AuthorizationRequestState, CallbackInput, ClientIdDocumentClient, ClientIdentity, CreateSolidOidcClientOptions, FetchLike, SolidOidcSession, SolidOidcTokens, StaticClient, } from "./types.js";
 //# sourceMappingURL=index.d.ts.map
