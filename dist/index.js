@@ -376,26 +376,22 @@ async function bufferBody(body, signal) {
 }
 async function readStreamWithSignal(stream, signal) {
   const reader = stream.getReader();
-  const abortPromise = () => new Promise((_resolve, reject) => {
-    if (signal === void 0) {
-      return;
-    }
-    if (signal.aborted) {
-      reject(abortReason(signal));
-      return;
-    }
-    signal.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+  let removeAbortListener;
+  const abortRace = signal === void 0 ? void 0 : new Promise((_resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
   });
-  if (signal?.aborted) {
-    await reader.cancel(abortReason(signal)).catch(() => {
-    });
-    throw abortReason(signal);
-  }
+  abortRace?.catch(() => {
+  });
   const chunks = [];
   let total = 0;
   try {
+    if (signal?.aborted) {
+      throw abortReason(signal);
+    }
     for (; ; ) {
-      const result = signal === void 0 ? await reader.read() : await Promise.race([reader.read(), abortPromise()]);
+      const result = abortRace ? await Promise.race([reader.read(), abortRace]) : await reader.read();
       if (result.done) {
         break;
       }
@@ -407,6 +403,7 @@ async function readStreamWithSignal(stream, signal) {
     });
     throw err;
   } finally {
+    removeAbortListener?.();
     reader.releaseLock();
   }
   const out = new Uint8Array(total);

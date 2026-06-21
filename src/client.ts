@@ -554,32 +554,35 @@ async function readStreamWithSignal(
   signal: AbortSignal | undefined,
 ): Promise<ArrayBuffer> {
   const reader = stream.getReader();
-  // A promise that rejects when the signal aborts; never resolves otherwise.
-  const abortPromise = (): Promise<never> =>
-    new Promise<never>((_resolve, reject) => {
-      if (signal === undefined) {
-        return; // never rejects — the read drives completion
-      }
-      if (signal.aborted) {
-        reject(abortReason(signal));
-        return;
-      }
-      signal.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
-    });
 
-  if (signal?.aborted) {
-    await reader.cancel(abortReason(signal)).catch(() => {});
-    throw abortReason(signal);
-  }
+  // ONE abort listener for the whole read (not one per chunk). `abortRace` is a single promise
+  // that rejects when the signal fires; it is reused across every `reader.read()`. The listener is
+  // removed in the `finally` below, so a long multi-chunk read does not accumulate stale listeners
+  // (a roborev finding).
+  let removeAbortListener: (() => void) | undefined;
+  const abortRace: Promise<never> | undefined =
+    signal === undefined
+      ? undefined
+      : new Promise<never>((_resolve, reject) => {
+          const onAbort = () => reject(abortReason(signal));
+          signal.addEventListener("abort", onAbort, { once: true });
+          removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+        });
+  // Swallow the abortRace rejection if it never wins the race (avoids an unhandled rejection when
+  // the read completes first and we stop awaiting it).
+  abortRace?.catch(() => {});
 
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
+    // Route the already-aborted case through the same try/finally so the lock is always released.
+    if (signal?.aborted) {
+      throw abortReason(signal);
+    }
     for (;;) {
-      const result =
-        signal === undefined
-          ? await reader.read()
-          : await Promise.race([reader.read(), abortPromise()]);
+      const result = abortRace
+        ? await Promise.race([reader.read(), abortRace])
+        : await reader.read();
       if (result.done) {
         break;
       }
@@ -591,6 +594,7 @@ async function readStreamWithSignal(
     await reader.cancel(err).catch(() => {});
     throw err;
   } finally {
+    removeAbortListener?.();
     reader.releaseLock();
   }
 
