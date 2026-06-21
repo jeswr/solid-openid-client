@@ -110,18 +110,29 @@ function hasSecret(id) {
 }
 function selectClientAuth(identity, tokenEndpointAuthMethod) {
   if (!hasSecret(identity)) {
+    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none" && tokenEndpointAuthMethod !== "private_key_jwt" && tokenEndpointAuthMethod !== "tls_client_auth") {
+      throw new Error(
+        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" requires a \`clientSecret\`, but none was supplied (a public client must use \`none\`).`
+      );
+    }
     return oidc.None();
   }
   const secret = identity.clientSecret;
   switch (tokenEndpointAuthMethod) {
+    case void 0:
+    // default for a confidential client
+    case "client_secret_post":
+      return oidc.ClientSecretPost(secret);
     case "client_secret_basic":
       return oidc.ClientSecretBasic(secret);
-    case "none":
-      return oidc.None();
     case "client_secret_jwt":
       return oidc.ClientSecretJwt(secret);
+    case "none":
+      return oidc.None();
     default:
-      return oidc.ClientSecretPost(secret);
+      throw new Error(
+        `createSolidOidcClient: unsupported token_endpoint_auth_method "${tokenEndpointAuthMethod}". Supported: client_secret_post (default), client_secret_basic, client_secret_jwt, none.`
+      );
   }
 }
 function isLoopbackHost2(hostname) {
@@ -468,7 +479,7 @@ function callbackToUrl(callback, redirectUri) {
   const u = new URL(redirectUri);
   const params = callback.params instanceof URLSearchParams ? callback.params : new URLSearchParams(callback.params);
   for (const [k, v] of params) {
-    u.searchParams.set(k, v);
+    u.searchParams.append(k, v);
   }
   return u;
 }

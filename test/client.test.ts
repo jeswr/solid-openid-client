@@ -371,6 +371,40 @@ describe("handleCallback — happy path", () => {
     expect(tokenReq?.body ?? "").toContain("p0stsecret");
   });
 
+  // Regression (roborev Low, whole-tree-11): an unsupported/misspelled token_endpoint_auth_method
+  // must THROW, not silently fall back to posting the secret.
+  it("rejects an unsupported token_endpoint_auth_method", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: "c", webId: WEBID });
+    await expect(
+      createSolidOidcClient({
+        issuer: ISSUER,
+        redirectUri: REDIRECT_URI,
+        client: {
+          clientId: "c",
+          clientSecret: "s",
+          clientMetadata: { token_endpoint_auth_method: "client_secret_bsaic" /* typo */ },
+        },
+        fetch: op.fetch,
+      }),
+    ).rejects.toThrow(/unsupported token_endpoint_auth_method/i);
+  });
+
+  // A public client (no secret) configured with a secret-based method is a misconfiguration.
+  it("rejects a public client configured with a secret-based auth method", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: "pub", webId: WEBID });
+    await expect(
+      createSolidOidcClient({
+        issuer: ISSUER,
+        redirectUri: REDIRECT_URI,
+        client: {
+          clientId: "pub",
+          clientMetadata: { token_endpoint_auth_method: "client_secret_basic" },
+        },
+        fetch: op.fetch,
+      }),
+    ).rejects.toThrow(/requires a `clientSecret`|public client must use `none`/i);
+  });
+
   it("accepts the params form of the callback input", async () => {
     const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
     const client = await createSolidOidcClient({
@@ -383,6 +417,26 @@ describe("handleCallback — happy path", () => {
     const { code, state: returnedState } = op.authorize(url);
     const session = await client.handleCallback({ params: { code, state: returnedState } }, state);
     expect(session.webId).toBe(WEBID);
+  });
+
+  // Regression (roborev Medium, whole-tree-11): a params-form callback with DUPLICATE security
+  // params (parameter pollution) must NOT be silently collapsed — openid-client must see the
+  // duplicates and fail closed.
+  it("FAILS closed on duplicate callback params (no silent collapse)", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const polluted = new URLSearchParams();
+    polluted.append("code", code);
+    polluted.append("state", returnedState);
+    polluted.append("state", "attacker-injected-second-state"); // duplicate
+    await expect(client.handleCallback({ params: polluted }, state)).rejects.toThrow();
   });
 });
 
