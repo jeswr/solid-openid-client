@@ -99,6 +99,19 @@ function resolveIdentity(opts) {
     return opts.client;
   }
   if (opts.clientId !== void 0) {
+    let u;
+    try {
+      u = new URL(opts.clientId);
+    } catch {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an absolute https: Client Identifier Document URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
+      );
+    }
+    if (u.protocol !== "https:") {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an https: URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
+      );
+    }
     return { clientId: opts.clientId };
   }
   throw new Error(
@@ -110,9 +123,9 @@ function hasSecret(id) {
 }
 function selectClientAuth(identity, tokenEndpointAuthMethod) {
   if (!hasSecret(identity)) {
-    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none" && tokenEndpointAuthMethod !== "private_key_jwt" && tokenEndpointAuthMethod !== "tls_client_auth") {
+    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none") {
       throw new Error(
-        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" requires a \`clientSecret\`, but none was supplied (a public client must use \`none\`).`
+        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not supported for a public client (no \`clientSecret\`). A public client must use \`none\`; private_key_jwt / tls_client_auth (which need a key/cert) are not implemented.`
       );
     }
     return oidc.None();

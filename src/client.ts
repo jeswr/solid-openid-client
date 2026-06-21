@@ -87,6 +87,25 @@ function resolveIdentity(opts: CreateSolidOidcClientOptions): ClientIdentity {
     return opts.client;
   }
   if (opts.clientId !== undefined) {
+    // The shorthand `clientId` is, by contract, a Solid Client Identifier Document URL — it MUST be
+    // an absolute https: URL (the OP dereferences it). Validate it so a non-URL / non-https value is
+    // a clear error rather than a confusing downstream failure (a roborev finding). An opaque /
+    // statically-registered client id goes via the full `client` option instead.
+    let u: URL;
+    try {
+      u = new URL(opts.clientId);
+    } catch {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an absolute https: Client Identifier ` +
+          `Document URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`,
+      );
+    }
+    if (u.protocol !== "https:") {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an https: URL (got "${opts.clientId}"). ` +
+          "For an opaque/static client id, use the `client` option.",
+      );
+    }
     return { clientId: opts.clientId };
   }
   throw new Error(
@@ -117,18 +136,16 @@ function selectClientAuth(
   identity: ClientIdentity,
   tokenEndpointAuthMethod: string | undefined,
 ): oidc.ClientAuth {
-  // No secret → public client. A `none` method is consistent; any secret-based method without a
-  // secret is a misconfiguration (fail closed rather than silently authenticate-less).
+  // No secret → public client. ONLY `none` (or unset) is supported without credential material:
+  // a secret-based method without a secret, OR private_key_jwt / tls_client_auth (which need a
+  // private key / client cert this package does not wire), would otherwise SILENTLY downgrade to
+  // `none`. We fail closed so the caller fixes the metadata (a roborev finding).
   if (!hasSecret(identity)) {
-    if (
-      tokenEndpointAuthMethod !== undefined &&
-      tokenEndpointAuthMethod !== "none" &&
-      tokenEndpointAuthMethod !== "private_key_jwt" &&
-      tokenEndpointAuthMethod !== "tls_client_auth"
-    ) {
+    if (tokenEndpointAuthMethod !== undefined && tokenEndpointAuthMethod !== "none") {
       throw new Error(
-        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" requires a ` +
-          "`clientSecret`, but none was supplied (a public client must use `none`).",
+        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not ` +
+          "supported for a public client (no `clientSecret`). A public client must use `none`; " +
+          "private_key_jwt / tls_client_auth (which need a key/cert) are not implemented.",
       );
     }
     return oidc.None();

@@ -117,6 +117,51 @@ describe("createSolidOidcClient — construction guards", () => {
     ).rejects.toThrow(/client identity is required/i);
   });
 
+  // Regression (roborev Medium, whole-tree-12): the shorthand clientId must be an absolute https
+  // Client Identifier Document URL (an opaque id goes via the `client` option).
+  it.each([
+    "not-a-url",
+    "http://app.example/client-id",
+    "urn:client:foo",
+  ])("rejects a non-https shorthand clientId: %s", async (clientId) => {
+    await expect(
+      createSolidOidcClient({ issuer: ISSUER, clientId, redirectUri: REDIRECT_URI }),
+    ).rejects.toThrow(/clientId.*https|absolute https/i);
+  });
+
+  // An opaque/static client id is still accepted via the full `client` option (no URL constraint).
+  it("accepts an opaque client id via the `client` option", async () => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: "opaque-static-id", webId: WEBID });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      redirectUri: REDIRECT_URI,
+      client: { clientId: "opaque-static-id" },
+      fetch: op.fetch,
+    });
+    expect(client.issuer).toBe(ISSUER);
+  });
+
+  // Regression (roborev Medium, whole-tree-12): a public client must not request a credential-based
+  // auth method (would silently downgrade to none).
+  it.each([
+    "private_key_jwt",
+    "tls_client_auth",
+    "client_secret_basic",
+  ])("rejects a public client requesting %s", async (method) => {
+    const op = await createMockOp({ issuer: ISSUER, clientId: "pub2", webId: WEBID });
+    await expect(
+      createSolidOidcClient({
+        issuer: ISSUER,
+        redirectUri: REDIRECT_URI,
+        client: {
+          clientId: "pub2",
+          clientMetadata: { token_endpoint_auth_method: method },
+        },
+        fetch: op.fetch,
+      }),
+    ).rejects.toThrow(/public client|not supported|requires a `clientSecret`/i);
+  });
+
   // Regression (roborev Medium, whole-tree-5): a redirectUri with a query/fragment is rejected
   // (openid-client strips query when deriving the token-endpoint redirect_uri → OP mismatch).
   it.each([
