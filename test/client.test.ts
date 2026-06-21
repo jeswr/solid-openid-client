@@ -5,18 +5,19 @@
  * `openid-client` genuinely validates / rejects — the tests are non-vacuous.
  *
  * Coverage (per the security spec):
- *   - happy path: code → DPoP-bound tokens → webid (from the ID token)
- *   - webid read from the access token when absent from the ID token
+ *   - happy path: code → DPoP-bound tokens → webid (from the VERIFIED ID token)
+ *   - an access-token-only webid is NOT trusted (fail-closed) — only the verified ID token is
  *   - PKCE verifier mismatch fails
  *   - state mismatch fails
  *   - nonce mismatch fails (ID-token binding)
  *   - missing-webid-claim fails (fail-closed)
  *   - opaque access token with no ID-token webid fails (fail-closed)
- *   - refresh round-trips a NEW DPoP-bound access token (+ rotated refresh token)
- *   - the authed fetch attaches a valid DPoP proof bound to the access token (ath)
- *   - the authed fetch retries on the §8 DPoP-Nonce challenge
- *   - http issuer rejected unless allowInsecure; both-client-forms / no-client errors
- *   - the token-endpoint request carried a DPoP proof (sender-constrained)
+ *   - a caller cannot override reserved auth params (PKCE/state/nonce/scope/...)
+ *   - refresh round-trips a NEW DPoP-bound access token (+ rotated, or carried-forward, refresh token)
+ *   - the authed fetch attaches a valid DPoP proof bound to the access token (ath); §8 nonce retry
+ *   - the authed fetch refuses plaintext http (no token leak); stream-body replay cap
+ *   - http issuer/resource rejected unless allowInsecure (incl. IPv6 loopback); client-form errors
+ *   - the token-endpoint request carried a DPoP proof (sender-constrained) + correct redirect_uri
  */
 
 import { describe, expect, it } from "vitest";
@@ -808,6 +809,47 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     expect(res.status).toBe(200);
     const sent = op.captured.find((r) => r.url.includes("/resource/"));
     expect(sent?.body).toBe("small");
+  });
+
+  // Regression (roborev Medium, whole-tree-4): a RELATIVE URL must resolve against a document base
+  // (browser-like), not throw — matching DOM fetch. We stub globalThis.location for the test.
+  it("resolves a relative resource URL against the document base (browser-like)", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    const hadLocation = "location" in globalThis;
+    const prev = (globalThis as { location?: unknown }).location;
+    (globalThis as { location?: unknown }).location = { href: "https://op.example/app/" };
+    try {
+      const res = await client.fetch("/resource/doc.ttl");
+      expect(res.status).toBe(200);
+      // resolved to the absolute https URL under the document origin
+      const sent = op.captured.find((r) => r.url.includes("/resource/"));
+      expect(sent?.url).toBe("https://op.example/resource/doc.ttl");
+      expect(op.lastResourceDpop()?.payload.htu).toBe("https://op.example/resource/doc.ttl");
+    } finally {
+      if (hadLocation) {
+        (globalThis as { location?: unknown }).location = prev;
+      } else {
+        // biome-ignore lint/performance/noDelete: test cleanup of a stubbed global
+        delete (globalThis as { location?: unknown }).location;
+      }
+    }
+  });
+
+  // Server-side (no document base): a relative URL throws a clear error rather than a raw URL parse.
+  it("throws a clear error for a relative URL with no document base (server-side)", async () => {
+    const { client } = await login();
+    const hadLocation = "location" in globalThis;
+    const prev = (globalThis as { location?: unknown }).location;
+    // biome-ignore lint/performance/noDelete: ensure no document base for this assertion
+    delete (globalThis as { location?: unknown }).location;
+    try {
+      await expect(client.fetch("/resource/doc.ttl")).rejects.toThrow(/absolute URL/i);
+    } finally {
+      if (hadLocation) {
+        (globalThis as { location?: unknown }).location = prev;
+      }
+    }
   });
 });
 

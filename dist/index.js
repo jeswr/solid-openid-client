@@ -145,6 +145,19 @@ function assertSecureTransport(rawUrl, allowInsecure, makeError) {
 function assertIssuerTransport2(issuer, allowInsecure) {
   assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
 }
+function resolveUrl(input) {
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  const base = globalThis.location?.href;
+  try {
+    return base !== void 0 ? new URL(input, base).toString() : new URL(input).toString();
+  } catch {
+    throw new Error(
+      `authedFetch: \`${input}\` is not an absolute URL and there is no document base to resolve it against (server-side). Pass an absolute https URL.`
+    );
+  }
+}
 function extractWebId(tokenResponse) {
   const idClaims = tokenResponse.claims();
   const fromWebidClaim = idClaims?.webid;
@@ -228,7 +241,7 @@ async function createSolidOidcClient(opts) {
     }
     const accessToken = currentTokens.accessToken;
     const reqInput = input instanceof Request ? input : void 0;
-    const url = reqInput ? reqInput.url : input.toString();
+    const url = input instanceof Request ? input.url : resolveUrl(input);
     assertSecureTransport(
       url,
       allowInsecure,

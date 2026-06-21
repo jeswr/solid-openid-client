@@ -22,7 +22,7 @@ export interface SolidOidcTokens {
     readonly tokenType: string;
     /** Refresh token, present iff `offline_access` was granted. Persist this to refresh later. */
     readonly refreshToken?: string;
-    /** The OIDC ID token (JWS). The `webid` claim is read from here (or the access token). */
+    /** The OIDC ID token (JWS). The WebID is read ONLY from this verified token (never the access token). */
     readonly idToken?: string;
     /** Seconds until the access token expires, as reported by the token endpoint. */
     readonly expiresIn?: number;

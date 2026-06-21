@@ -162,6 +162,28 @@ function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
 }
 
 /**
+ * Resolve a string/URL `fetch` input to an absolute URL string, the way browser `fetch` does: a
+ * relative URL is resolved against the document base (`globalThis.location.href`) when present (a
+ * browser/worker), else it must be absolute (server-side Node has no base — a relative URL throws a
+ * clear error). This keeps the authed `fetch` a drop-in for the DOM `fetch` in a browser context
+ * while staying strict server-side.
+ */
+function resolveUrl(input: string | URL): string {
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  const base = (globalThis as { location?: { href?: string } }).location?.href;
+  try {
+    return base !== undefined ? new URL(input, base).toString() : new URL(input).toString();
+  } catch {
+    throw new Error(
+      `authedFetch: \`${input}\` is not an absolute URL and there is no document base to resolve it ` +
+        "against (server-side). Pass an absolute https URL.",
+    );
+  }
+}
+
+/**
  * Read the `webid` claim — Solid-OIDC's WebID — from the token response, FAIL-CLOSED.
  *
  * SECURITY: the WebID is read ONLY from the **verified ID token** (`claims()` — openid-client has
@@ -358,7 +380,10 @@ export async function createSolidOidcClient(
     }
     const accessToken = currentTokens.accessToken;
     const reqInput = input instanceof Request ? input : undefined;
-    const url = reqInput ? reqInput.url : input.toString();
+    // A `Request` always carries an absolute `.url`. A string/URL input may be RELATIVE (browser
+    // `fetch` resolves it against the document base); resolve it the same way so we don't reject a
+    // valid relative URL — and so the transport check + `htu` + the fetch all use one absolute URL.
+    const url = input instanceof Request ? input.url : resolveUrl(input);
 
     // SECURITY: never attach the DPoP access token + proof to a plaintext URL — that would leak the
     // bearer-class token over the wire. Require https (http only on loopback when allowInsecure),

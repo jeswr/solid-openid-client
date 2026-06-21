@@ -136,26 +136,33 @@ These are this package's choices (the maintainer can steer them — see the open
    The DPoP private key **must** be persisted with the refresh token because the OP binds the
    refresh token to the keypair's `jkt` — a refresh signed by a regenerated key is rejected.
 
-5. **Fail-closed on the WebID.** A login produces no session unless a resolvable `http(s)` `webid`
-   claim is present (read from the verified ID token, falling back to the access token). No WebID →
+5. **Fail-closed on the WebID — verified ID token ONLY.** A login produces no session unless a
+   resolvable `http(s)` WebID is present in the **verified ID token** (the `webid` claim, or `sub`
+   when `sub` is itself the WebID). The WebID is **never** trusted from the access token: a client
+   does not verify the access token's signature (that is the resource server's job), so an unsigned
+   / attacker-shaped access-token claim must not establish a session identity. No verified WebID →
    `handleCallback` throws.
 
-6. **Asymmetric DPoP, PKCE always, state + nonce always, no token logging, TLS issuers.** PKCE
+6. **Asymmetric DPoP, PKCE always, state + nonce always, no token logging, TLS everywhere.** PKCE
    (S256), a random `state` (CSRF), and a random `nonce` (ID-token binding) are generated and
-   validated on **every** flow regardless of OP metadata. `http:` issuers are rejected unless
-   `allowInsecure` is set for a loopback dev OP. Tokens are never logged.
+   validated on **every** flow regardless of OP metadata. `http:` issuers **and** `http:` resource
+   URLs (the authed `fetch` never sends the DPoP token over plaintext) are rejected unless
+   `allowInsecure` is set for a loopback host. Tokens are never logged.
 
 ## Security
 
 This is an **auth package**. The flow is tested exhaustively against a **faithful mock OP** (no live
 IdP, no network, no ports): the mock signs **real ES256 ID tokens**, serves a real JWKS, and
-verifies PKCE S256 — so `openid-client` genuinely validates / rejects and the tests are non-vacuous.
-Covered: happy path (code → DPoP-bound tokens → WebID), WebID from the access token, **PKCE
-mismatch fails**, **state mismatch fails**, **nonce mismatch fails**, **missing-WebID fails
-(fail-closed)**, opaque-access-token-with-no-WebID fails, non-`http(s)` WebID fails, **refresh
-round-trips a new DPoP-bound token + rotated refresh token**, the **authed `fetch` attaches a valid
-DPoP proof with `ath` = SHA-256(access_token) and `jkt` matching the keypair**, the §8 `DPoP-Nonce`
-retry, a fresh `jti` per request, and the transport guards.
+verifies PKCE S256 + the token-endpoint `redirect_uri` — so `openid-client` genuinely validates /
+rejects and the tests are non-vacuous. Covered: happy path (code → DPoP-bound tokens → WebID from
+the **verified ID token**), **PKCE mismatch fails**, **state mismatch fails**, **nonce mismatch
+fails**, **missing-WebID fails (fail-closed)**, **an access-token-only WebID is NOT trusted
+(fail-closed)**, non-`http(s)` WebID fails, **a caller cannot override the reserved auth params**,
+**refresh round-trips a new DPoP-bound token + rotated refresh token (and carries the prior token
+forward when the OP does not rotate)**, the **authed `fetch` attaches a valid DPoP proof with
+`ath` = SHA-256(access_token) and `jkt` matching the keypair**, the §8 `DPoP-Nonce` retry, a fresh
+`jti` per request, **refusal to send the DPoP token over plaintext http**, the **stream-body replay
+cap**, and the loopback transport guards (incl. IPv6).
 
 ## License
 
