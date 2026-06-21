@@ -197,6 +197,11 @@ function isHttpUri(value) {
   }
 }
 function toSolidTokens(res) {
+  if (res.token_type === void 0 || res.token_type.toLowerCase() !== "dpop") {
+    throw new Error(
+      `Solid-OIDC requires DPoP-bound (sender-constrained) tokens, but the OP returned token_type "${res.token_type ?? "none"}". Refusing a non-DPoP token (fail-closed).`
+    );
+  }
   const base = {
     accessToken: res.access_token,
     tokenType: res.token_type

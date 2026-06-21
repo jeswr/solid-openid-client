@@ -382,6 +382,28 @@ describe("handleCallback — security: rejections (fail-closed)", () => {
     await expect(client.handleCallback({ url: callbackUrl }, state)).rejects.toThrow(/webid/i);
   });
 
+  // Regression (roborev High, whole-tree-6): a bearer token returned to a DPoP-bound flow is a
+  // sender-constraint DOWNGRADE — it must be rejected, never stored as a successful session.
+  it("FAILS fail-closed when the OP returns a non-DPoP (bearer) token_type", async () => {
+    const op = await createMockOp({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: WEBID,
+      tokenTypeOverride: "Bearer", // downgrade
+    });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    await expect(
+      client.handleCallback({ url: `${REDIRECT_URI}?code=${code}&state=${returnedState}` }, state),
+    ).rejects.toThrow(/dpop|sender-constrained/i);
+  });
+
   // Regression (roborev High, whole-tree): a `webid` in the (CLIENT-UNVERIFIED) access token must
   // NOT establish a session — the WebID is read only from the verified ID token. The mock here
   // puts the webid ONLY in the access token; login must FAIL fail-closed.

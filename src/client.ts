@@ -267,10 +267,26 @@ function isHttpUri(value: string): boolean {
   }
 }
 
-/** Map an openid-client token response into our public {@link SolidOidcTokens}. */
+/**
+ * Map an openid-client token response into our public {@link SolidOidcTokens}, ENFORCING that the
+ * token is DPoP-bound.
+ *
+ * SECURITY (DPoP-downgrade guard): Solid-OIDC tokens are sender-constrained via DPoP. openid-client
+ * / oauth4webapi accepts BOTH `bearer` and `dpop` token types, so an OP that (mistakenly or
+ * maliciously) returns a plain `bearer` token to our DPoP-bound request would otherwise be stored
+ * and exposed as a successful Solid session — silently dropping the proof-of-possession guarantee.
+ * We FAIL CLOSED: a token response whose `token_type` is not `dpop` (case-insensitive per RFC) is
+ * rejected (a roborev finding). Applies to both the code exchange and refresh.
+ */
 function toSolidTokens(
   res: oidc.TokenEndpointResponse & oidc.TokenEndpointResponseHelpers,
 ): SolidOidcTokens {
+  if (res.token_type === undefined || res.token_type.toLowerCase() !== "dpop") {
+    throw new Error(
+      `Solid-OIDC requires DPoP-bound (sender-constrained) tokens, but the OP returned token_type ` +
+        `"${res.token_type ?? "none"}". Refusing a non-DPoP token (fail-closed).`,
+    );
+  }
   const base: { accessToken: string; tokenType: string } = {
     accessToken: res.access_token,
     tokenType: res.token_type,

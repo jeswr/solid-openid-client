@@ -58,6 +58,11 @@ export interface MockOpOptions {
    * non-loopback host) to test that the client rejects an insecure discovered endpoint.
    */
   readonly evilTokenEndpoint?: string;
+  /**
+   * Return a non-DPoP `token_type` (e.g. "Bearer") to test the DPoP-downgrade guard — the client
+   * must reject a bearer token for a DPoP-bound flow.
+   */
+  readonly tokenTypeOverride?: string;
 }
 
 export interface MockOp {
@@ -289,7 +294,7 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
     void tokenDpop;
     const out: Record<string, unknown> = {
       access_token: accessToken,
-      token_type: "DPoP",
+      token_type: opts.tokenTypeOverride ?? "DPoP",
       expires_in: 600,
       scope: "openid webid offline_access",
     };
