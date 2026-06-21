@@ -455,6 +455,69 @@ describe("the authed fetch — DPoP proof bound to the access token (ath)", () =
     expect(op.lastResourceDpop()?.payload.nonce).toBe("nonce-1");
   });
 
+  // Regression (roborev Medium round 2): an explicit init.body that is a ReadableStream must also
+  // be buffered so the §8 nonce retry replays it (not just the Request-body path).
+  it("replays an explicit ReadableStream init.body on the §8 nonce retry", async () => {
+    const { op, client } = await login();
+    op.captured.length = 0;
+    op.challengeNextResourceWithNonce("nonce-stream");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("stream-payload"));
+        controller.close();
+      },
+    });
+    const res = await client.fetch("https://op.example/resource/doc.ttl", {
+      method: "POST",
+      body: stream,
+      // a duplex is required by the spec for a stream body; harmless for the fake fetch.
+      // @ts-expect-error duplex is not yet in the DOM RequestInit lib types
+      duplex: "half",
+    });
+    expect(res.status).toBe(200);
+    const resourceReqs = op.captured.filter((r) => r.url.includes("/resource/"));
+    expect(resourceReqs.length).toBe(2);
+    expect(resourceReqs[0]?.body).toBe("stream-payload");
+    expect(resourceReqs[1]?.body).toBe("stream-payload"); // replayed, not consumed
+  });
+
+  // Regression (roborev Low round 2): Request transport fields are carried over, not dropped.
+  it("carries over a Request's transport fields (credentials/mode/cache/redirect)", async () => {
+    const { client } = await login();
+    let seenInit: RequestInit | undefined;
+    // Wrap the op fetch to capture the init the client actually passes to the underlying fetch.
+    const op2 = await createMockOp({ issuer: ISSUER, clientId: CLIENT_ID, webId: WEBID });
+    const spyFetch = (input: string | URL | Request, init?: RequestInit) => {
+      seenInit = init;
+      return op2.fetch(input, init);
+    };
+    const client2 = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: spyFetch,
+    });
+    const { url, state } = await client2.authorizationUrl();
+    const { code, state: returnedState } = op2.authorize(url);
+    await client2.handleCallback(
+      { url: `${REDIRECT_URI}?code=${code}&state=${returnedState}` },
+      state,
+    );
+    void client; // the first login is just to ensure the helper path is exercised
+    const req = new Request("https://op.example/resource/doc.ttl", {
+      method: "GET",
+      credentials: "include",
+      mode: "cors",
+      cache: "no-store",
+      redirect: "follow",
+    });
+    await client2.fetch(req);
+    expect(seenInit?.credentials).toBe("include");
+    expect(seenInit?.mode).toBe("cors");
+    expect(seenInit?.cache).toBe("no-store");
+    expect(seenInit?.redirect).toBe("follow");
+  });
+
   // An explicit init.body overrides a Request body (fetch precedence).
   it("lets an explicit init override a Request's method/body", async () => {
     const { op, client } = await login();

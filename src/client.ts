@@ -327,25 +327,26 @@ export async function createSolidOidcClient(
     // Effective method: explicit init wins, else the Request's, else GET.
     const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
 
-    // Effective base RequestInit, carrying over the Request's transport fields when init omits
-    // them, so nothing (mode/credentials/redirect/signal/…) is silently dropped.
+    // Effective base RequestInit, carrying over ALL relevant transport fields from the Request
+    // first, then letting an explicit init override them, so nothing (mode/credentials/cache/
+    // redirect/integrity/keepalive/referrer/referrerPolicy/signal/…) is silently dropped when we
+    // replace the original `Request` with `userFetch(url, init)`.
     const baseInit: RequestInit = {
-      ...(reqInput
-        ? {
-            method: reqInput.method,
-            redirect: reqInput.redirect,
-            ...(reqInput.signal ? { signal: reqInput.signal } : {}),
-          }
-        : {}),
+      ...(reqInput ? requestTransportFields(reqInput) : {}),
       ...(init ?? {}),
       method,
     };
+    // `body` is owned by the buffering logic below — never leak the original (possibly already
+    // consumed) stream from baseInit into the per-attempt RequestInit.
+    delete (baseInit as { body?: unknown }).body;
 
-    // Buffer the body ONCE so it is replayable across the original + nonce-retry attempts.
+    // Buffer the body ONCE so it is REPLAYABLE across the original + nonce-retry attempts — a
+    // non-replayable stream (a `Request` body, or a `ReadableStream` passed via init.body) would
+    // otherwise be consumed by the first attempt and the §8 retry would send an empty/locked body.
     // Precedence matches `fetch`: an explicit `init.body` wins over the Request's body.
     let bufferedBody: BodyInit | undefined;
     if (init && "body" in init) {
-      bufferedBody = (init.body ?? undefined) as BodyInit | undefined;
+      bufferedBody = await bufferBody((init.body ?? undefined) as BodyInit | null | undefined);
     } else if (reqInput && reqInput.body !== null) {
       // A Request body is a stream; read it to an ArrayBuffer so we can send it more than once.
       bufferedBody = await reqInput.clone().arrayBuffer();
@@ -483,6 +484,44 @@ function callbackToUrl(callback: CallbackInput): URL {
 
 function stripTrailingSlash(s: string): string {
   return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+/**
+ * Extract the transport-relevant fields of a `Request` into a `RequestInit`, so replacing the
+ * Request with `userFetch(url, init)` does not silently drop fetch semantics (credentials, mode,
+ * cache, redirect, integrity, keepalive, referrer, referrerPolicy, signal). `body`/`method`/
+ * `headers` are handled separately by the authed-fetch buffering + header-merge logic.
+ */
+function requestTransportFields(req: Request): RequestInit {
+  return {
+    method: req.method,
+    redirect: req.redirect,
+    cache: req.cache,
+    credentials: req.credentials,
+    integrity: req.integrity,
+    keepalive: req.keepalive,
+    mode: req.mode,
+    referrer: req.referrer,
+    referrerPolicy: req.referrerPolicy,
+    ...(req.signal ? { signal: req.signal } : {}),
+  };
+}
+
+/**
+ * Buffer a body into a REPLAYABLE form. A `ReadableStream` (or a `Request`/`Response`) is read
+ * once into an `ArrayBuffer` so it can be sent on both the original attempt and the §8 nonce
+ * retry; all other `BodyInit` values (string / `Uint8Array` / `Blob` / `URLSearchParams` /
+ * `FormData` / `ArrayBuffer`) are already replayable and pass through unchanged. `null`/`undefined`
+ * → `undefined`.
+ */
+async function bufferBody(body: BodyInit | null | undefined): Promise<BodyInit | undefined> {
+  if (body === null || body === undefined) {
+    return undefined;
+  }
+  if (body instanceof ReadableStream) {
+    return new Response(body).arrayBuffer();
+  }
+  return body;
 }
 
 /**

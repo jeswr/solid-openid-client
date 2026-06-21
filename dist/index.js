@@ -220,17 +220,14 @@ async function createSolidOidcClient(opts) {
     const url = reqInput ? reqInput.url : input.toString();
     const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
     const baseInit = {
-      ...reqInput ? {
-        method: reqInput.method,
-        redirect: reqInput.redirect,
-        ...reqInput.signal ? { signal: reqInput.signal } : {}
-      } : {},
+      ...reqInput ? requestTransportFields(reqInput) : {},
       ...init ?? {},
       method
     };
+    delete baseInit.body;
     let bufferedBody;
     if (init && "body" in init) {
-      bufferedBody = init.body ?? void 0;
+      bufferedBody = await bufferBody(init.body ?? void 0);
     } else if (reqInput && reqInput.body !== null) {
       bufferedBody = await reqInput.clone().arrayBuffer();
     }
@@ -346,6 +343,29 @@ function callbackToUrl(callback) {
 }
 function stripTrailingSlash(s) {
   return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+function requestTransportFields(req) {
+  return {
+    method: req.method,
+    redirect: req.redirect,
+    cache: req.cache,
+    credentials: req.credentials,
+    integrity: req.integrity,
+    keepalive: req.keepalive,
+    mode: req.mode,
+    referrer: req.referrer,
+    referrerPolicy: req.referrerPolicy,
+    ...req.signal ? { signal: req.signal } : {}
+  };
+}
+async function bufferBody(body) {
+  if (body === null || body === void 0) {
+    return void 0;
+  }
+  if (body instanceof ReadableStream) {
+    return new Response(body).arrayBuffer();
+  }
+  return body;
 }
 function adaptCustomFetch(userFetch) {
   return (url, options) => {
