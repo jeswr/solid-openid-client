@@ -25,7 +25,7 @@ export declare const DEFAULT_SCOPE = "openid webid offline_access";
  * The Solid-OIDC client handle returned by {@link createSolidOidcClient}. Stateful only insofar
  * as it holds the discovered configuration, the DPoP keypair, and (after a login/refresh) the
  * latest tokens — the consumer owns persistence (token storage is an injectable seam: persist
- * `currentTokens()` + `exportDpopKey()` yourself).
+ * `currentTokens()` + the `dpopKeyPair` yourself).
  */
 export interface SolidOidcClient {
     /** The issuer this client authenticates against. */

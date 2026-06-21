@@ -128,33 +128,38 @@ function assertIssuerTransport(issuer: string, allowInsecure: boolean): void {
 /**
  * Read the `webid` claim — Solid-OIDC's WebID — from the token response, FAIL-CLOSED.
  *
- * Per the Solid-OIDC spec the WebID is advertised in the `webid` claim of the ID token (the
- * primary location) and, on most OPs, also in the access token. We read the ID token claims via
- * openid-client's verified `claims()` helper (it has already validated signature + `iss`/`aud`/
- * `nonce`), then fall back to a parsed access-token `webid`. If neither yields an `http(s)` WebID,
- * we THROW — a session is never returned without a resolvable WebID.
+ * SECURITY: the WebID is read ONLY from the **verified ID token** (`claims()` — openid-client has
+ * already validated its signature against the OP JWKS plus `iss`/`aud`/`nonce`). We deliberately do
+ * NOT fall back to the access token: a client does not (and must not) verify the access token's
+ * signature — that is the resource server's job — so trusting a `webid` claim parsed from a
+ * client-opaque access token would let an unsigned / attacker-shaped token establish a session
+ * identity. The Solid-OIDC spec advertises the WebID in the ID token `webid` claim (or `sub` when
+ * `sub` is itself the WebID); both are read here from the verified ID token. If neither yields an
+ * `http(s)` WebID, we THROW — a session is never returned without a verified, resolvable WebID.
  */
 function extractWebId(
   tokenResponse: oidc.TokenEndpointResponse & oidc.TokenEndpointResponseHelpers,
 ): string {
-  // 1. Verified ID-token claims (preferred — signature/iss/aud/nonce already checked).
+  // Verified ID-token claims ONLY — signature + iss/aud/nonce already checked by openid-client.
   const idClaims = tokenResponse.claims();
-  const fromId = idClaims?.webid;
-  if (typeof fromId === "string" && isHttpUri(fromId)) {
-    return fromId;
+
+  // Primary: the `webid` claim.
+  const fromWebidClaim = idClaims?.webid;
+  if (typeof fromWebidClaim === "string" && isHttpUri(fromWebidClaim)) {
+    return fromWebidClaim;
   }
 
-  // 2. Fall back to a `webid` claim in the access token (many Solid OPs put it there too). The
-  //    access token's signature is the resource server's concern, not the client's — we only
-  //    read the claim opportunistically and still require it to be an http(s) IRI.
-  const fromAt = readAccessTokenWebId(tokenResponse.access_token);
-  if (fromAt !== undefined && isHttpUri(fromAt)) {
-    return fromAt;
+  // Some Solid OPs set the WebID as the `sub` (when `sub` is itself the WebID). Still from the
+  // VERIFIED ID token, so this is safe.
+  const fromSub = idClaims?.sub;
+  if (typeof fromSub === "string" && isHttpUri(fromSub)) {
+    return fromSub;
   }
 
   throw new Error(
-    "Solid-OIDC login produced no resolvable `webid` claim in the ID token or access token; " +
-      "refusing to return a session without a WebID (fail-closed).",
+    "Solid-OIDC login produced no resolvable `webid` claim in the VERIFIED ID token; refusing to " +
+      "return a session without a verified WebID (fail-closed). The WebID is never trusted from an " +
+      "unverified access token.",
   );
 }
 
@@ -165,28 +170,6 @@ function isHttpUri(value: string): boolean {
     return u.protocol === "https:" || u.protocol === "http:";
   } catch {
     return false;
-  }
-}
-
-/**
- * Best-effort read of a `webid` claim from a JWT access token's payload WITHOUT verifying its
- * signature (the RS verifies the access token, not us). Returns `undefined` for a non-JWT
- * (opaque) access token or any parse failure. We do NOT trust this beyond cross-checking an
- * http(s) shape; the ID-token path above is the authoritative one.
- */
-function readAccessTokenWebId(accessToken: string): string | undefined {
-  const parts = accessToken.split(".");
-  if (parts.length !== 3) {
-    return undefined; // opaque / non-JWT access token
-  }
-  try {
-    const payloadB64 = parts[1] as string;
-    const json = Buffer.from(payloadB64, "base64url").toString("utf8");
-    const payload = JSON.parse(json) as Record<string, unknown>;
-    const webid = payload.webid;
-    return typeof webid === "string" ? webid : undefined;
-  } catch {
-    return undefined;
   }
 }
 
@@ -211,7 +194,7 @@ function toSolidTokens(
  * The Solid-OIDC client handle returned by {@link createSolidOidcClient}. Stateful only insofar
  * as it holds the discovered configuration, the DPoP keypair, and (after a login/refresh) the
  * latest tokens — the consumer owns persistence (token storage is an injectable seam: persist
- * `currentTokens()` + `exportDpopKey()` yourself).
+ * `currentTokens()` + the `dpopKeyPair` yourself).
  */
 export interface SolidOidcClient {
   /** The issuer this client authenticates against. */
@@ -463,7 +446,7 @@ export async function createSolidOidcClient(
     },
 
     async handleCallback(callback, reqState) {
-      const currentUrl = callbackToUrl(callback);
+      const currentUrl = callbackToUrl(callback, reqState.redirectUri);
       const tokenResponse = await oidc.authorizationCodeGrant(
         config,
         currentUrl,
@@ -513,15 +496,23 @@ export async function createSolidOidcClient(
   };
 }
 
-/** Turn a {@link CallbackInput} into the `URL` openid-client expects. */
-function callbackToUrl(callback: CallbackInput): URL {
+/**
+ * Turn a {@link CallbackInput} into the `URL` openid-client expects, with the params-form URL built
+ * on the REGISTERED `redirectUri`.
+ *
+ * openid-client v6 derives the `redirect_uri` it sends to the token endpoint from this URL's
+ * origin+path. The params form must therefore be assembled on the real `redirectUri` base (NOT a
+ * placeholder), otherwise the OP receives a mismatched/invalid `redirect_uri` and rejects the code
+ * exchange (a roborev finding). For the `url` form the caller already supplies the full callback
+ * URL (which is the redirect URI + the response params), so we use it as-is.
+ */
+function callbackToUrl(callback: CallbackInput, redirectUri: string): URL {
   if ("url" in callback) {
     return callback.url instanceof URL ? callback.url : new URL(callback.url);
   }
-  // Params form: openid-client needs a URL. The base origin is irrelevant for code-flow
-  // extraction (only the query params matter), so we attach them to a placeholder URL. Using a
-  // non-absolute placeholder is fine because authorizationCodeGrant only reads searchParams.
-  const u = new URL("https://callback.invalid/");
+  // Params form: build the URL on the registered redirect URI so the derived redirect_uri is
+  // correct. Append the response params to whatever query the redirect URI already carries.
+  const u = new URL(redirectUri);
   const params =
     callback.params instanceof URLSearchParams
       ? callback.params

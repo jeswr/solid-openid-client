@@ -221,6 +221,19 @@ export async function createMockOp(opts: MockOpOptions): Promise<MockOp> {
       if (pkceS256(verifier) !== record.codeChallenge) {
         return json({ error: "invalid_grant", error_description: "PKCE verifier mismatch" }, 400);
       }
+      // Verify the token-endpoint `redirect_uri` matches the one from the authorization request
+      // (RFC 6749 §4.1.3) — a real OP rejects a mismatch. This catches a client that sends a
+      // placeholder redirect_uri (e.g. for the params-form callback).
+      const tokenRedirect = params.get("redirect_uri");
+      if (tokenRedirect !== record.redirectUri) {
+        return json(
+          {
+            error: "invalid_grant",
+            error_description: `redirect_uri mismatch (got ${tokenRedirect ?? "none"}, expected ${record.redirectUri})`,
+          },
+          400,
+        );
+      }
       authCodes.delete(code); // single-use
       const idToken = opts.omitIdToken ? undefined : await mintIdToken(record.nonce, opts.webId);
       const accessToken = await mintAccessToken();

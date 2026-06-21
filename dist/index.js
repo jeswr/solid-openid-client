@@ -132,16 +132,16 @@ function assertIssuerTransport2(issuer, allowInsecure) {
 }
 function extractWebId(tokenResponse) {
   const idClaims = tokenResponse.claims();
-  const fromId = idClaims?.webid;
-  if (typeof fromId === "string" && isHttpUri(fromId)) {
-    return fromId;
+  const fromWebidClaim = idClaims?.webid;
+  if (typeof fromWebidClaim === "string" && isHttpUri(fromWebidClaim)) {
+    return fromWebidClaim;
   }
-  const fromAt = readAccessTokenWebId(tokenResponse.access_token);
-  if (fromAt !== void 0 && isHttpUri(fromAt)) {
-    return fromAt;
+  const fromSub = idClaims?.sub;
+  if (typeof fromSub === "string" && isHttpUri(fromSub)) {
+    return fromSub;
   }
   throw new Error(
-    "Solid-OIDC login produced no resolvable `webid` claim in the ID token or access token; refusing to return a session without a WebID (fail-closed)."
+    "Solid-OIDC login produced no resolvable `webid` claim in the VERIFIED ID token; refusing to return a session without a verified WebID (fail-closed). The WebID is never trusted from an unverified access token."
   );
 }
 function isHttpUri(value) {
@@ -150,21 +150,6 @@ function isHttpUri(value) {
     return u.protocol === "https:" || u.protocol === "http:";
   } catch {
     return false;
-  }
-}
-function readAccessTokenWebId(accessToken) {
-  const parts = accessToken.split(".");
-  if (parts.length !== 3) {
-    return void 0;
-  }
-  try {
-    const payloadB64 = parts[1];
-    const json = Buffer.from(payloadB64, "base64url").toString("utf8");
-    const payload = JSON.parse(json);
-    const webid = payload.webid;
-    return typeof webid === "string" ? webid : void 0;
-  } catch {
-    return void 0;
   }
 }
 function toSolidTokens(res) {
@@ -313,7 +298,7 @@ async function createSolidOidcClient(opts) {
       };
     },
     async handleCallback(callback, reqState) {
-      const currentUrl = callbackToUrl(callback);
+      const currentUrl = callbackToUrl(callback, reqState.redirectUri);
       const tokenResponse = await oidc.authorizationCodeGrant(
         config,
         currentUrl,
@@ -358,11 +343,11 @@ async function createSolidOidcClient(opts) {
     }
   };
 }
-function callbackToUrl(callback) {
+function callbackToUrl(callback, redirectUri) {
   if ("url" in callback) {
     return callback.url instanceof URL ? callback.url : new URL(callback.url);
   }
-  const u = new URL("https://callback.invalid/");
+  const u = new URL(redirectUri);
   const params = callback.params instanceof URLSearchParams ? callback.params : new URLSearchParams(callback.params);
   for (const [k, v] of params) {
     u.searchParams.set(k, v);

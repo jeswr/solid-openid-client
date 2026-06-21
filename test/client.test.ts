@@ -203,16 +203,6 @@ describe("handleCallback — happy path", () => {
     expect(header.jwk).toBeDefined();
   });
 
-  it("reads the webid from the ACCESS token when the ID token omits it", async () => {
-    const { session } = await login({
-      issuer: ISSUER,
-      clientId: CLIENT_ID,
-      webId: undefined, // no webid in the ID token
-      webIdInAccessToken: WEBID, // present in the access token instead
-    });
-    expect(session.webId).toBe(WEBID);
-  });
-
   it("exposes currentTokens()/currentWebId() after login", async () => {
     const { client, session } = await login();
     expect(client.currentWebId()).toBe(session.webId);
@@ -326,6 +316,28 @@ describe("handleCallback — security: rejections (fail-closed)", () => {
       issuer: ISSUER,
       clientId: CLIENT_ID,
       webId: "urn:not-a-web-id",
+    });
+    const client = await createSolidOidcClient({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      fetch: op.fetch,
+    });
+    const { url, state } = await client.authorizationUrl();
+    const { code, state: returnedState } = op.authorize(url);
+    const callbackUrl = `${REDIRECT_URI}?code=${code}&state=${returnedState}`;
+    await expect(client.handleCallback({ url: callbackUrl }, state)).rejects.toThrow(/webid/i);
+  });
+
+  // Regression (roborev High, whole-tree): a `webid` in the (CLIENT-UNVERIFIED) access token must
+  // NOT establish a session — the WebID is read only from the verified ID token. The mock here
+  // puts the webid ONLY in the access token; login must FAIL fail-closed.
+  it("FAILS fail-closed: the access-token webid is NOT trusted (only the verified ID token is)", async () => {
+    const op = await createMockOp({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      webId: undefined, // no webid in the ID token
+      webIdInAccessToken: WEBID, // present ONLY in the access token — must be ignored
     });
     const client = await createSolidOidcClient({
       issuer: ISSUER,
