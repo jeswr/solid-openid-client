@@ -19,8 +19,6 @@
  */
 import type { DpopKeyPair } from "@jeswr/solid-dpop";
 import type { AuthorizationRequest, AuthorizationRequestState, CallbackInput, CreateSolidOidcClientOptions, FetchLike, SolidOidcSession, SolidOidcTokens } from "./types.js";
-/** Default scopes. `webid` is Solid-OIDC's WebID scope; `offline_access` yields a refresh token. */
-export declare const DEFAULT_SCOPE = "openid webid offline_access";
 /**
  * Default cap (bytes) on a STREAM request body buffered for §8 nonce-retry replay. A stream body
  * larger than this is rejected rather than buffered (so an upload cannot exhaust memory). 10 MiB —

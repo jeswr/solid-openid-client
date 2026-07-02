@@ -1,5 +1,5 @@
 // src/client.ts
-import * as oidc from "openid-client";
+import * as oidc2 from "openid-client";
 
 // node_modules/@jeswr/solid-dpop/dist/esm/authCode.js
 import { createHash as createHash2, randomBytes, randomUUID as randomUUID2 } from "node:crypto";
@@ -63,6 +63,79 @@ function resourceDpopProof(keyPair, method, url, accessToken, nonce) {
   return createDpopProof(
     nonce === void 0 ? { keyPair, htm: method, htu: url, accessToken } : { keyPair, htm: method, htu: url, accessToken, nonce }
   );
+}
+
+// src/identity.ts
+import * as oidc from "openid-client";
+var DEFAULT_SCOPE2 = "openid webid offline_access";
+function normalizeScope(scope) {
+  if (scope === void 0 || scope.trim() === "") {
+    return DEFAULT_SCOPE2;
+  }
+  const parts = scope.split(/\s+/).filter((s) => s.length > 0);
+  if (!parts.includes("openid")) {
+    parts.unshift("openid");
+  }
+  return [...new Set(parts)].join(" ");
+}
+function resolveIdentity(opts) {
+  if (opts.client !== void 0 && opts.clientId !== void 0) {
+    throw new Error(
+      "createSolidOidcClient: supply EITHER `clientId` (a Client ID Document URL) OR `client`, not both."
+    );
+  }
+  if (opts.client !== void 0) {
+    return opts.client;
+  }
+  if (opts.clientId !== void 0) {
+    let u;
+    try {
+      u = new URL(opts.clientId);
+    } catch {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an absolute https: Client Identifier Document URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
+      );
+    }
+    if (u.protocol !== "https:") {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an https: URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
+      );
+    }
+    return { clientId: opts.clientId };
+  }
+  throw new Error(
+    "createSolidOidcClient: a client identity is required \u2014 pass `clientId` (a Client ID Document URL, the primary path) or a full `client`."
+  );
+}
+function hasSecret(id) {
+  return "clientSecret" in id && typeof id.clientSecret === "string" && id.clientSecret.length > 0;
+}
+function selectClientAuth(identity, tokenEndpointAuthMethod) {
+  if (!hasSecret(identity)) {
+    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none") {
+      throw new Error(
+        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not supported for a public client (no \`clientSecret\`). A public client must use \`none\`; private_key_jwt / tls_client_auth (which need a key/cert) are not implemented.`
+      );
+    }
+    return oidc.None();
+  }
+  const secret = identity.clientSecret;
+  switch (tokenEndpointAuthMethod) {
+    case void 0:
+    // default for a confidential client
+    case "client_secret_post":
+      return oidc.ClientSecretPost(secret);
+    case "client_secret_basic":
+      return oidc.ClientSecretBasic(secret);
+    case "client_secret_jwt":
+      return oidc.ClientSecretJwt(secret);
+    case "none":
+      return oidc.None();
+    default:
+      throw new Error(
+        `createSolidOidcClient: unsupported token_endpoint_auth_method "${tokenEndpointAuthMethod}". Supported: client_secret_post (default), client_secret_basic, client_secret_jwt, none.`
+      );
+  }
 }
 
 // src/transport.ts
@@ -183,7 +256,6 @@ function toSolidTokens(res) {
 }
 
 // src/client.ts
-var DEFAULT_SCOPE2 = "openid webid offline_access";
 var DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
 var RESERVED_AUTH_PARAMS = /* @__PURE__ */ new Set([
   "client_id",
@@ -196,75 +268,6 @@ var RESERVED_AUTH_PARAMS = /* @__PURE__ */ new Set([
   "nonce",
   "dpop_jkt"
 ]);
-function normalizeScope(scope) {
-  if (scope === void 0 || scope.trim() === "") {
-    return DEFAULT_SCOPE2;
-  }
-  const parts = scope.split(/\s+/).filter((s) => s.length > 0);
-  if (!parts.includes("openid")) {
-    parts.unshift("openid");
-  }
-  return [...new Set(parts)].join(" ");
-}
-function resolveIdentity(opts) {
-  if (opts.client !== void 0 && opts.clientId !== void 0) {
-    throw new Error(
-      "createSolidOidcClient: supply EITHER `clientId` (a Client ID Document URL) OR `client`, not both."
-    );
-  }
-  if (opts.client !== void 0) {
-    return opts.client;
-  }
-  if (opts.clientId !== void 0) {
-    let u;
-    try {
-      u = new URL(opts.clientId);
-    } catch {
-      throw new Error(
-        `createSolidOidcClient: \`clientId\` shorthand must be an absolute https: Client Identifier Document URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
-      );
-    }
-    if (u.protocol !== "https:") {
-      throw new Error(
-        `createSolidOidcClient: \`clientId\` shorthand must be an https: URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
-      );
-    }
-    return { clientId: opts.clientId };
-  }
-  throw new Error(
-    "createSolidOidcClient: a client identity is required \u2014 pass `clientId` (a Client ID Document URL, the primary path) or a full `client`."
-  );
-}
-function hasSecret(id) {
-  return "clientSecret" in id && typeof id.clientSecret === "string" && id.clientSecret.length > 0;
-}
-function selectClientAuth(identity, tokenEndpointAuthMethod) {
-  if (!hasSecret(identity)) {
-    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none") {
-      throw new Error(
-        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not supported for a public client (no \`clientSecret\`). A public client must use \`none\`; private_key_jwt / tls_client_auth (which need a key/cert) are not implemented.`
-      );
-    }
-    return oidc.None();
-  }
-  const secret = identity.clientSecret;
-  switch (tokenEndpointAuthMethod) {
-    case void 0:
-    // default for a confidential client
-    case "client_secret_post":
-      return oidc.ClientSecretPost(secret);
-    case "client_secret_basic":
-      return oidc.ClientSecretBasic(secret);
-    case "client_secret_jwt":
-      return oidc.ClientSecretJwt(secret);
-    case "none":
-      return oidc.None();
-    default:
-      throw new Error(
-        `createSolidOidcClient: unsupported token_endpoint_auth_method "${tokenEndpointAuthMethod}". Supported: client_secret_post (default), client_secret_basic, client_secret_jwt, none.`
-      );
-  }
-}
 function resolveUrl(input) {
   if (input instanceof URL) {
     return input.toString();
@@ -303,10 +306,10 @@ async function createSolidOidcClient(opts) {
     typeof authMethod === "string" ? authMethod : void 0
   );
   const discoveryOptions = {
-    [oidc.customFetch]: adaptCustomFetch(userFetch),
-    ...allowInsecure ? { execute: [oidc.allowInsecureRequests] } : {}
+    [oidc2.customFetch]: adaptCustomFetch(userFetch),
+    ...allowInsecure ? { execute: [oidc2.allowInsecureRequests] } : {}
   };
-  const config = await oidc.discovery(
+  const config = await oidc2.discovery(
     new URL(opts.issuer),
     identity.clientId,
     baseMetadata,
@@ -337,7 +340,7 @@ async function createSolidOidcClient(opts) {
       );
     }
   }
-  const dpopHandle = oidc.getDPoPHandle(config, toCryptoKeyPair(dpopKeyPair));
+  const dpopHandle = oidc2.getDPoPHandle(config, toCryptoKeyPair(dpopKeyPair));
   let currentTokens;
   let currentWebId;
   const authedFetch2 = async (input, init) => {
@@ -414,10 +417,10 @@ async function createSolidOidcClient(opts) {
     currentTokens: () => currentTokens,
     currentWebId: () => currentWebId,
     async authorizationUrl(extraParams) {
-      const codeVerifier = oidc.randomPKCECodeVerifier();
-      const codeChallenge = await oidc.calculatePKCECodeChallenge(codeVerifier);
-      const state = oidc.randomState();
-      const nonce = oidc.randomNonce();
+      const codeVerifier = oidc2.randomPKCECodeVerifier();
+      const codeChallenge = await oidc2.calculatePKCECodeChallenge(codeVerifier);
+      const state = oidc2.randomState();
+      const nonce = oidc2.randomNonce();
       if (extraParams) {
         const overridden = Object.keys(extraParams).filter((k) => RESERVED_AUTH_PARAMS.has(k));
         if (overridden.length > 0) {
@@ -437,7 +440,7 @@ async function createSolidOidcClient(opts) {
         nonce,
         dpop_jkt: dpopKeyPair.thumbprint
       };
-      const url = oidc.buildAuthorizationUrl(config, params);
+      const url = oidc2.buildAuthorizationUrl(config, params);
       return {
         url: url.href,
         state: { codeVerifier, state, nonce, redirectUri }
@@ -445,7 +448,7 @@ async function createSolidOidcClient(opts) {
     },
     async handleCallback(callback, reqState) {
       const currentUrl = callbackToUrl(callback, reqState.redirectUri);
-      const tokenResponse = await oidc.authorizationCodeGrant(
+      const tokenResponse = await oidc2.authorizationCodeGrant(
         config,
         currentUrl,
         {
@@ -474,7 +477,7 @@ async function createSolidOidcClient(opts) {
         );
       }
       const sameSession = refreshTokenArg === void 0 || refreshTokenArg === currentTokens?.refreshToken;
-      const res = await oidc.refreshTokenGrant(config, refreshToken, void 0, {
+      const res = await oidc2.refreshTokenGrant(config, refreshToken, void 0, {
         DPoP: dpopHandle
       });
       let tokens = toSolidTokens(res);

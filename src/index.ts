@@ -15,7 +15,6 @@
 export {
   createSolidOidcClient,
   DEFAULT_MAX_REPLAY_BODY_BYTES,
-  DEFAULT_SCOPE,
   type SolidOidcClient,
 } from "./client.js";
 export {
@@ -25,6 +24,7 @@ export {
   resourceDpopProof,
   toCryptoKeyPair,
 } from "./dpop.js";
+export { DEFAULT_SCOPE } from "./identity.js";
 export type {
   AuthorizationRequest,
   AuthorizationRequestState,
