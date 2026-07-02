@@ -65,6 +65,74 @@ function resourceDpopProof(keyPair, method, url, accessToken, nonce) {
   );
 }
 
+// src/transport.ts
+function isLoopbackHost2(hostname) {
+  const host = hostname.toLowerCase();
+  if (host === "localhost") {
+    return true;
+  }
+  const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (unbracketed === "::1") {
+    return true;
+  }
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(unbracketed)) {
+    const octets = unbracketed.split(".").map(Number);
+    return octets.every((o) => o >= 0 && o <= 255);
+  }
+  return false;
+}
+function assertSecureTransport(rawUrl, allowInsecure, makeError) {
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    throw makeError(`not a valid URL: ${rawUrl}`);
+  }
+  if (u.protocol === "https:") {
+    return;
+  }
+  if (u.protocol === "http:") {
+    if (allowInsecure && isLoopbackHost2(u.hostname)) {
+      return;
+    }
+    throw makeError(
+      `refusing an insecure http: URL (${rawUrl}). https is required; http: is permitted only for a loopback host with \`allowInsecure: true\`.`
+    );
+  }
+  throw makeError(`unsupported URL scheme in ${rawUrl} (expected https:).`);
+}
+function assertIssuerTransport2(issuer, allowInsecure) {
+  assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
+}
+function assertRedirectUri(redirectUri) {
+  let u;
+  try {
+    u = new URL(redirectUri);
+  } catch {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`
+    );
+  }
+  if (u.protocol === "http:" && !isLoopbackHost2(u.hostname)) {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` must be https for a non-loopback host (${redirectUri}). http: is permitted only for a loopback redirect URI (the RFC 8252 native-app pattern).`
+    );
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` has an unsupported scheme (${redirectUri}); expected https:.`
+    );
+  }
+  if (u.search !== "" || u.hash !== "") {
+    throw new Error(
+      `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). openid-client derives the token-endpoint redirect_uri from the callback origin+path (query stripped), so a query here would mismatch and the OP would reject the code exchange. Carry per-flow data in \`state\` / \`authorizationUrl(extraParams)\` instead.`
+    );
+  }
+}
+function stripTrailingSlash(s) {
+  return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
 // src/client.ts
 var DEFAULT_SCOPE2 = "openid webid offline_access";
 var DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
@@ -146,69 +214,6 @@ function selectClientAuth(identity, tokenEndpointAuthMethod) {
       throw new Error(
         `createSolidOidcClient: unsupported token_endpoint_auth_method "${tokenEndpointAuthMethod}". Supported: client_secret_post (default), client_secret_basic, client_secret_jwt, none.`
       );
-  }
-}
-function isLoopbackHost2(hostname) {
-  const host = hostname.toLowerCase();
-  if (host === "localhost") {
-    return true;
-  }
-  const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-  if (unbracketed === "::1") {
-    return true;
-  }
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(unbracketed)) {
-    const octets = unbracketed.split(".").map(Number);
-    return octets.every((o) => o >= 0 && o <= 255);
-  }
-  return false;
-}
-function assertSecureTransport(rawUrl, allowInsecure, makeError) {
-  let u;
-  try {
-    u = new URL(rawUrl);
-  } catch {
-    throw makeError(`not a valid URL: ${rawUrl}`);
-  }
-  if (u.protocol === "https:") {
-    return;
-  }
-  if (u.protocol === "http:") {
-    if (allowInsecure && isLoopbackHost2(u.hostname)) {
-      return;
-    }
-    throw makeError(
-      `refusing an insecure http: URL (${rawUrl}). https is required; http: is permitted only for a loopback host with \`allowInsecure: true\`.`
-    );
-  }
-  throw makeError(`unsupported URL scheme in ${rawUrl} (expected https:).`);
-}
-function assertIssuerTransport2(issuer, allowInsecure) {
-  assertSecureTransport(issuer, allowInsecure, (msg) => new Error(`createSolidOidcClient: ${msg}`));
-}
-function assertRedirectUri(redirectUri) {
-  let u;
-  try {
-    u = new URL(redirectUri);
-  } catch {
-    throw new Error(
-      `createSolidOidcClient: \`redirectUri\` is not a valid absolute URL: ${redirectUri}`
-    );
-  }
-  if (u.protocol === "http:" && !isLoopbackHost2(u.hostname)) {
-    throw new Error(
-      `createSolidOidcClient: \`redirectUri\` must be https for a non-loopback host (${redirectUri}). http: is permitted only for a loopback redirect URI (the RFC 8252 native-app pattern).`
-    );
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    throw new Error(
-      `createSolidOidcClient: \`redirectUri\` has an unsupported scheme (${redirectUri}); expected https:.`
-    );
-  }
-  if (u.search !== "" || u.hash !== "") {
-    throw new Error(
-      `createSolidOidcClient: \`redirectUri\` must not contain a query string or fragment (${redirectUri}). openid-client derives the token-endpoint redirect_uri from the callback origin+path (query stripped), so a query here would mismatch and the OP would reject the code exchange. Carry per-flow data in \`state\` / \`authorizationUrl(extraParams)\` instead.`
-    );
   }
 }
 function resolveUrl(input) {
@@ -495,9 +500,6 @@ function callbackToUrl(callback, redirectUri) {
     u.searchParams.append(k, v);
   }
   return u;
-}
-function stripTrailingSlash(s) {
-  return s.endsWith("/") ? s.slice(0, -1) : s;
 }
 function requestTransportFields(req) {
   return {
