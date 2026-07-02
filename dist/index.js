@@ -202,6 +202,59 @@ function selectClientAuth(identity, tokenEndpointAuthMethod) {
   }
 }
 
+// src/request-adapter.ts
+function resolveUrl(input) {
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  const g = globalThis;
+  const base = g.document?.baseURI ?? g.location?.href;
+  try {
+    return base !== void 0 ? new URL(input, base).toString() : new URL(input).toString();
+  } catch {
+    throw new Error(
+      `authedFetch: \`${input}\` is not an absolute URL and there is no document base to resolve it against (server-side). Pass an absolute https URL.`
+    );
+  }
+}
+function callbackToUrl(callback, redirectUri) {
+  if ("url" in callback) {
+    return callback.url instanceof URL ? callback.url : new URL(callback.url);
+  }
+  const u = new URL(redirectUri);
+  const params = callback.params instanceof URLSearchParams ? callback.params : new URLSearchParams(callback.params);
+  for (const [k, v] of params) {
+    u.searchParams.append(k, v);
+  }
+  return u;
+}
+function requestTransportFields(req) {
+  return {
+    method: req.method,
+    redirect: req.redirect,
+    cache: req.cache,
+    credentials: req.credentials,
+    integrity: req.integrity,
+    keepalive: req.keepalive,
+    mode: req.mode,
+    referrer: req.referrer,
+    referrerPolicy: req.referrerPolicy,
+    ...req.signal ? { signal: req.signal } : {}
+  };
+}
+function adaptCustomFetch(userFetch) {
+  return (url, options) => {
+    const init = {
+      method: options.method,
+      headers: options.headers,
+      redirect: options.redirect,
+      ...options.body !== void 0 ? { body: options.body } : {},
+      ...options.signal !== void 0 ? { signal: options.signal } : {}
+    };
+    return userFetch(url, init);
+  };
+}
+
 // src/transport.ts
 function isLoopbackHost2(hostname) {
   const host = hostname.toLowerCase();
@@ -331,20 +384,6 @@ var RESERVED_AUTH_PARAMS = /* @__PURE__ */ new Set([
   "nonce",
   "dpop_jkt"
 ]);
-function resolveUrl(input) {
-  if (input instanceof URL) {
-    return input.toString();
-  }
-  const g = globalThis;
-  const base = g.document?.baseURI ?? g.location?.href;
-  try {
-    return base !== void 0 ? new URL(input, base).toString() : new URL(input).toString();
-  } catch {
-    throw new Error(
-      `authedFetch: \`${input}\` is not an absolute URL and there is no document base to resolve it against (server-side). Pass an absolute https URL.`
-    );
-  }
-}
 async function createSolidOidcClient(opts) {
   const allowInsecure = opts.allowInsecure === true;
   assertIssuerTransport2(opts.issuer, allowInsecure);
@@ -556,43 +595,6 @@ async function createSolidOidcClient(opts) {
       }
       return tokens;
     }
-  };
-}
-function callbackToUrl(callback, redirectUri) {
-  if ("url" in callback) {
-    return callback.url instanceof URL ? callback.url : new URL(callback.url);
-  }
-  const u = new URL(redirectUri);
-  const params = callback.params instanceof URLSearchParams ? callback.params : new URLSearchParams(callback.params);
-  for (const [k, v] of params) {
-    u.searchParams.append(k, v);
-  }
-  return u;
-}
-function requestTransportFields(req) {
-  return {
-    method: req.method,
-    redirect: req.redirect,
-    cache: req.cache,
-    credentials: req.credentials,
-    integrity: req.integrity,
-    keepalive: req.keepalive,
-    mode: req.mode,
-    referrer: req.referrer,
-    referrerPolicy: req.referrerPolicy,
-    ...req.signal ? { signal: req.signal } : {}
-  };
-}
-function adaptCustomFetch(userFetch) {
-  return (url, options) => {
-    const init = {
-      method: options.method,
-      headers: options.headers,
-      redirect: options.redirect,
-      ...options.body !== void 0 ? { body: options.body } : {},
-      ...options.signal !== void 0 ? { signal: options.signal } : {}
-    };
-    return userFetch(url, init);
   };
 }
 export {

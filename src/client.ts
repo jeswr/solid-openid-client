@@ -25,6 +25,12 @@ import { bufferBody, DEFAULT_MAX_REPLAY_BODY_BYTES, readStreamWithSignal } from 
 import { generateDpopKeyPair, resourceDpopProof, toCryptoKeyPair } from "./dpop.js";
 import { hasSecret, normalizeScope, resolveIdentity, selectClientAuth } from "./identity.js";
 import {
+  adaptCustomFetch,
+  callbackToUrl,
+  requestTransportFields,
+  resolveUrl,
+} from "./request-adapter.js";
+import {
   assertIssuerTransport,
   assertRedirectUri,
   assertSecureTransport,
@@ -57,35 +63,6 @@ const RESERVED_AUTH_PARAMS = new Set([
   "nonce",
   "dpop_jkt",
 ]);
-
-/**
- * Resolve a string/URL `fetch` input to an absolute URL string, the way browser `fetch` does: a
- * relative URL is resolved against the document base when present (a browser/worker), else it must
- * be absolute (server-side Node has no base — a relative URL throws a clear error). This keeps the
- * authed `fetch` a drop-in for the DOM `fetch` in a browser context while staying strict
- * server-side.
- *
- * The base is `document.baseURI` (which honours a `<base href>`) when in a document context —
- * matching native `fetch` exactly — falling back to `location.href` for a worker-like context.
- */
-function resolveUrl(input: string | URL): string {
-  if (input instanceof URL) {
-    return input.toString();
-  }
-  const g = globalThis as {
-    document?: { baseURI?: string };
-    location?: { href?: string };
-  };
-  const base = g.document?.baseURI ?? g.location?.href;
-  try {
-    return base !== undefined ? new URL(input, base).toString() : new URL(input).toString();
-  } catch {
-    throw new Error(
-      `authedFetch: \`${input}\` is not an absolute URL and there is no document base to resolve it ` +
-        "against (server-side). Pass an absolute https URL.",
-    );
-  }
-}
 
 /**
  * The Solid-OIDC client handle returned by {@link createSolidOidcClient}. Stateful only insofar
@@ -456,76 +433,5 @@ export async function createSolidOidcClient(
       }
       return tokens;
     },
-  };
-}
-
-/**
- * Turn a {@link CallbackInput} into the `URL` openid-client expects, with the params-form URL built
- * on the REGISTERED `redirectUri`.
- *
- * openid-client v6 derives the `redirect_uri` it sends to the token endpoint from this URL's
- * origin+path. The params form must therefore be assembled on the real `redirectUri` base (NOT a
- * placeholder), otherwise the OP receives a mismatched/invalid `redirect_uri` and rejects the code
- * exchange (a roborev finding). For the `url` form the caller already supplies the full callback
- * URL (which is the redirect URI + the response params), so we use it as-is.
- */
-function callbackToUrl(callback: CallbackInput, redirectUri: string): URL {
-  if ("url" in callback) {
-    return callback.url instanceof URL ? callback.url : new URL(callback.url);
-  }
-  // Params form: build the URL on the registered redirect URI so the derived redirect_uri is
-  // correct. The redirect URI is guaranteed query-free (asserted at construction), so we APPEND the
-  // response params — preserving DUPLICATES (e.g. a polluted `code`/`state`/`iss`/`error`) so
-  // openid-client / oauth4webapi sees the original parameters and fails closed on pollution, rather
-  // than us silently collapsing them with `set()` (a roborev finding).
-  const u = new URL(redirectUri);
-  const params =
-    callback.params instanceof URLSearchParams
-      ? callback.params
-      : new URLSearchParams(callback.params);
-  for (const [k, v] of params) {
-    u.searchParams.append(k, v);
-  }
-  return u;
-}
-
-/**
- * Extract the transport-relevant fields of a `Request` into a `RequestInit`, so replacing the
- * Request with `userFetch(url, init)` does not silently drop fetch semantics (credentials, mode,
- * cache, redirect, integrity, keepalive, referrer, referrerPolicy, signal). `body`/`method`/
- * `headers` are handled separately by the authed-fetch buffering + header-merge logic.
- */
-function requestTransportFields(req: Request): RequestInit {
-  return {
-    method: req.method,
-    redirect: req.redirect,
-    cache: req.cache,
-    credentials: req.credentials,
-    integrity: req.integrity,
-    keepalive: req.keepalive,
-    mode: req.mode,
-    referrer: req.referrer,
-    referrerPolicy: req.referrerPolicy,
-    ...(req.signal ? { signal: req.signal } : {}),
-  };
-}
-
-/**
- * Adapt a DOM-shaped {@link FetchLike} into openid-client's `CustomFetch`
- * (`(url, CustomFetchOptions) => Promise<Response>`). `CustomFetchOptions` is structurally a
- * subset of `RequestInit` (`body`/`headers`/`method`/`redirect`/`signal`), so it forwards
- * directly. We preserve openid-client's `redirect: "manual"` (it relies on inspecting redirects
- * itself, not following them) and pass through the abort `signal`.
- */
-function adaptCustomFetch(userFetch: FetchLike): oidc.CustomFetch {
-  return (url, options) => {
-    const init: RequestInit = {
-      method: options.method,
-      headers: options.headers,
-      redirect: options.redirect,
-      ...(options.body !== undefined ? { body: options.body as BodyInit } : {}),
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    };
-    return userFetch(url, init);
   };
 }
