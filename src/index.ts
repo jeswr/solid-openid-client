@@ -12,11 +12,8 @@
  * is a normal dependency (bundled into the committed `dist/` for GitHub-branch installs).
  */
 
-export {
-  createSolidOidcClient,
-  DEFAULT_MAX_REPLAY_BODY_BYTES,
-  type SolidOidcClient,
-} from "./client.js";
+export { DEFAULT_MAX_REPLAY_BODY_BYTES } from "./body-buffer.js";
+export { createSolidOidcClient, type SolidOidcClient } from "./client.js";
 export {
   type CryptoKeyPairLike,
   type DpopKeyPair,

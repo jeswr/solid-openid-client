@@ -20,12 +20,6 @@
 import type { DpopKeyPair } from "@jeswr/solid-dpop";
 import type { AuthorizationRequest, AuthorizationRequestState, CallbackInput, CreateSolidOidcClientOptions, FetchLike, SolidOidcSession, SolidOidcTokens } from "./types.js";
 /**
- * Default cap (bytes) on a STREAM request body buffered for §8 nonce-retry replay. A stream body
- * larger than this is rejected rather than buffered (so an upload cannot exhaust memory). 10 MiB —
- * generous for typical Solid resource writes; raise via `maxReplayBodyBytes` for larger uploads.
- */
-export declare const DEFAULT_MAX_REPLAY_BODY_BYTES: number;
-/**
  * The Solid-OIDC client handle returned by {@link createSolidOidcClient}. Stateful only insofar
  * as it holds the discovered configuration, the DPoP keypair, and (after a login/refresh) the
  * latest tokens — the consumer owns persistence (token storage is an injectable seam: persist

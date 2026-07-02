@@ -1,3 +1,67 @@
+// src/body-buffer.ts
+var DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
+async function bufferBody(body, signal, maxBytes) {
+  if (body === null || body === void 0) {
+    return void 0;
+  }
+  if (body instanceof ReadableStream) {
+    return readStreamWithSignal(body, signal, maxBytes);
+  }
+  return body;
+}
+async function readStreamWithSignal(stream, signal, maxBytes) {
+  const reader = stream.getReader();
+  let removeAbortListener;
+  const abortRace = signal === void 0 ? void 0 : new Promise((_resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+  });
+  abortRace?.catch(() => {
+  });
+  const chunks = [];
+  let total = 0;
+  try {
+    if (signal?.aborted) {
+      throw abortReason(signal);
+    }
+    for (; ; ) {
+      const result = abortRace ? await Promise.race([reader.read(), abortRace]) : await reader.read();
+      if (result.done) {
+        break;
+      }
+      total += result.value.byteLength;
+      if (total > maxBytes) {
+        throw new Error(
+          `authedFetch: request stream body exceeds the ${maxBytes}-byte replay buffer cap. Raise \`maxReplayBodyBytes\` to upload a larger body (it is buffered so the \xA78 DPoP-nonce retry can replay it).`
+        );
+      }
+      chunks.push(result.value);
+    }
+  } catch (err) {
+    await reader.cancel(err).catch(() => {
+    });
+    throw err;
+  } finally {
+    removeAbortListener?.();
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer.slice(0, total);
+}
+function abortReason(signal) {
+  const reason = signal.reason;
+  if (reason !== void 0) {
+    return reason;
+  }
+  return new DOMException("The operation was aborted.", "AbortError");
+}
+
 // src/client.ts
 import * as oidc2 from "openid-client";
 
@@ -256,7 +320,6 @@ function toSolidTokens(res) {
 }
 
 // src/client.ts
-var DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
 var RESERVED_AUTH_PARAMS = /* @__PURE__ */ new Set([
   "client_id",
   "redirect_uri",
@@ -519,67 +582,6 @@ function requestTransportFields(req) {
     referrerPolicy: req.referrerPolicy,
     ...req.signal ? { signal: req.signal } : {}
   };
-}
-async function bufferBody(body, signal, maxBytes) {
-  if (body === null || body === void 0) {
-    return void 0;
-  }
-  if (body instanceof ReadableStream) {
-    return readStreamWithSignal(body, signal, maxBytes);
-  }
-  return body;
-}
-async function readStreamWithSignal(stream, signal, maxBytes) {
-  const reader = stream.getReader();
-  let removeAbortListener;
-  const abortRace = signal === void 0 ? void 0 : new Promise((_resolve, reject) => {
-    const onAbort = () => reject(abortReason(signal));
-    signal.addEventListener("abort", onAbort, { once: true });
-    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
-  });
-  abortRace?.catch(() => {
-  });
-  const chunks = [];
-  let total = 0;
-  try {
-    if (signal?.aborted) {
-      throw abortReason(signal);
-    }
-    for (; ; ) {
-      const result = abortRace ? await Promise.race([reader.read(), abortRace]) : await reader.read();
-      if (result.done) {
-        break;
-      }
-      total += result.value.byteLength;
-      if (total > maxBytes) {
-        throw new Error(
-          `authedFetch: request stream body exceeds the ${maxBytes}-byte replay buffer cap. Raise \`maxReplayBodyBytes\` to upload a larger body (it is buffered so the \xA78 DPoP-nonce retry can replay it).`
-        );
-      }
-      chunks.push(result.value);
-    }
-  } catch (err) {
-    await reader.cancel(err).catch(() => {
-    });
-    throw err;
-  } finally {
-    removeAbortListener?.();
-    reader.releaseLock();
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out.buffer.slice(0, total);
-}
-function abortReason(signal) {
-  const reason = signal.reason;
-  if (reason !== void 0) {
-    return reason;
-  }
-  return new DOMException("The operation was aborted.", "AbortError");
 }
 function adaptCustomFetch(userFetch) {
   return (url, options) => {
