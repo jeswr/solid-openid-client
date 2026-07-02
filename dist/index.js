@@ -133,6 +133,55 @@ function stripTrailingSlash(s) {
   return s.endsWith("/") ? s.slice(0, -1) : s;
 }
 
+// src/webid.ts
+function isHttpUri(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+function extractWebIdOrUndefined(tokenResponse) {
+  const idClaims = tokenResponse.claims();
+  const fromWebidClaim = idClaims?.webid;
+  if (typeof fromWebidClaim === "string" && isHttpUri(fromWebidClaim)) {
+    return fromWebidClaim;
+  }
+  const fromSub = idClaims?.sub;
+  if (typeof fromSub === "string" && isHttpUri(fromSub)) {
+    return fromSub;
+  }
+  return void 0;
+}
+function extractWebId(tokenResponse) {
+  const webId = extractWebIdOrUndefined(tokenResponse);
+  if (webId !== void 0) {
+    return webId;
+  }
+  throw new Error(
+    "Solid-OIDC login produced no resolvable `webid` claim in the VERIFIED ID token; refusing to return a session without a verified WebID (fail-closed). The WebID is never trusted from an unverified access token."
+  );
+}
+function toSolidTokens(res) {
+  if (res.token_type === void 0 || res.token_type.toLowerCase() !== "dpop") {
+    throw new Error(
+      `Solid-OIDC requires DPoP-bound (sender-constrained) tokens, but the OP returned token_type "${res.token_type ?? "none"}". Refusing a non-DPoP token (fail-closed).`
+    );
+  }
+  const base = {
+    accessToken: res.access_token,
+    tokenType: res.token_type
+  };
+  return {
+    ...base,
+    ...res.refresh_token !== void 0 ? { refreshToken: res.refresh_token } : {},
+    ...res.id_token !== void 0 ? { idToken: res.id_token } : {},
+    ...res.expires_in !== void 0 ? { expiresIn: res.expires_in } : {},
+    ...res.scope !== void 0 ? { scope: res.scope } : {}
+  };
+}
+
 // src/client.ts
 var DEFAULT_SCOPE2 = "openid webid offline_access";
 var DEFAULT_MAX_REPLAY_BODY_BYTES = 10 * 1024 * 1024;
@@ -229,53 +278,6 @@ function resolveUrl(input) {
       `authedFetch: \`${input}\` is not an absolute URL and there is no document base to resolve it against (server-side). Pass an absolute https URL.`
     );
   }
-}
-function extractWebIdOrUndefined(tokenResponse) {
-  const idClaims = tokenResponse.claims();
-  const fromWebidClaim = idClaims?.webid;
-  if (typeof fromWebidClaim === "string" && isHttpUri(fromWebidClaim)) {
-    return fromWebidClaim;
-  }
-  const fromSub = idClaims?.sub;
-  if (typeof fromSub === "string" && isHttpUri(fromSub)) {
-    return fromSub;
-  }
-  return void 0;
-}
-function extractWebId(tokenResponse) {
-  const webId = extractWebIdOrUndefined(tokenResponse);
-  if (webId !== void 0) {
-    return webId;
-  }
-  throw new Error(
-    "Solid-OIDC login produced no resolvable `webid` claim in the VERIFIED ID token; refusing to return a session without a verified WebID (fail-closed). The WebID is never trusted from an unverified access token."
-  );
-}
-function isHttpUri(value) {
-  try {
-    const u = new URL(value);
-    return u.protocol === "https:" || u.protocol === "http:";
-  } catch {
-    return false;
-  }
-}
-function toSolidTokens(res) {
-  if (res.token_type === void 0 || res.token_type.toLowerCase() !== "dpop") {
-    throw new Error(
-      `Solid-OIDC requires DPoP-bound (sender-constrained) tokens, but the OP returned token_type "${res.token_type ?? "none"}". Refusing a non-DPoP token (fail-closed).`
-    );
-  }
-  const base = {
-    accessToken: res.access_token,
-    tokenType: res.token_type
-  };
-  return {
-    ...base,
-    ...res.refresh_token !== void 0 ? { refreshToken: res.refresh_token } : {},
-    ...res.id_token !== void 0 ? { idToken: res.id_token } : {},
-    ...res.expires_in !== void 0 ? { expiresIn: res.expires_in } : {},
-    ...res.scope !== void 0 ? { scope: res.scope } : {}
-  };
 }
 async function createSolidOidcClient(opts) {
   const allowInsecure = opts.allowInsecure === true;
