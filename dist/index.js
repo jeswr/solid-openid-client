@@ -129,79 +129,6 @@ function resourceDpopProof(keyPair, method, url, accessToken, nonce) {
   );
 }
 
-// src/identity.ts
-import * as oidc from "openid-client";
-var DEFAULT_SCOPE2 = "openid webid offline_access";
-function normalizeScope(scope) {
-  if (scope === void 0 || scope.trim() === "") {
-    return DEFAULT_SCOPE2;
-  }
-  const parts = scope.split(/\s+/).filter((s) => s.length > 0);
-  if (!parts.includes("openid")) {
-    parts.unshift("openid");
-  }
-  return [...new Set(parts)].join(" ");
-}
-function resolveIdentity(opts) {
-  if (opts.client !== void 0 && opts.clientId !== void 0) {
-    throw new Error(
-      "createSolidOidcClient: supply EITHER `clientId` (a Client ID Document URL) OR `client`, not both."
-    );
-  }
-  if (opts.client !== void 0) {
-    return opts.client;
-  }
-  if (opts.clientId !== void 0) {
-    let u;
-    try {
-      u = new URL(opts.clientId);
-    } catch {
-      throw new Error(
-        `createSolidOidcClient: \`clientId\` shorthand must be an absolute https: Client Identifier Document URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
-      );
-    }
-    if (u.protocol !== "https:") {
-      throw new Error(
-        `createSolidOidcClient: \`clientId\` shorthand must be an https: URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
-      );
-    }
-    return { clientId: opts.clientId };
-  }
-  throw new Error(
-    "createSolidOidcClient: a client identity is required \u2014 pass `clientId` (a Client ID Document URL, the primary path) or a full `client`."
-  );
-}
-function hasSecret(id) {
-  return "clientSecret" in id && typeof id.clientSecret === "string" && id.clientSecret.length > 0;
-}
-function selectClientAuth(identity, tokenEndpointAuthMethod) {
-  if (!hasSecret(identity)) {
-    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none") {
-      throw new Error(
-        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not supported for a public client (no \`clientSecret\`). A public client must use \`none\`; private_key_jwt / tls_client_auth (which need a key/cert) are not implemented.`
-      );
-    }
-    return oidc.None();
-  }
-  const secret = identity.clientSecret;
-  switch (tokenEndpointAuthMethod) {
-    case void 0:
-    // default for a confidential client
-    case "client_secret_post":
-      return oidc.ClientSecretPost(secret);
-    case "client_secret_basic":
-      return oidc.ClientSecretBasic(secret);
-    case "client_secret_jwt":
-      return oidc.ClientSecretJwt(secret);
-    case "none":
-      return oidc.None();
-    default:
-      throw new Error(
-        `createSolidOidcClient: unsupported token_endpoint_auth_method "${tokenEndpointAuthMethod}". Supported: client_secret_post (default), client_secret_basic, client_secret_jwt, none.`
-      );
-  }
-}
-
 // src/request-adapter.ts
 function resolveUrl(input) {
   if (input instanceof URL) {
@@ -321,6 +248,151 @@ function assertRedirectUri(redirectUri) {
 }
 function stripTrailingSlash(s) {
   return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+// src/authed-fetch.ts
+function createAuthedFetch(deps) {
+  const { getAccessToken, dpopKeyPair, allowInsecure, maxReplayBodyBytes, userFetch } = deps;
+  return async (input, init) => {
+    const accessToken = getAccessToken();
+    if (accessToken === void 0) {
+      throw new Error(
+        "authedFetch: no access token yet \u2014 call handleCallback()/refresh() before fetching."
+      );
+    }
+    const reqInput = input instanceof Request ? input : void 0;
+    const url = input instanceof Request ? input.url : resolveUrl(input);
+    assertSecureTransport(
+      url,
+      allowInsecure,
+      (msg) => new Error(`authedFetch: ${msg} \u2014 refusing to send the DPoP token over plaintext.`)
+    );
+    const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
+    const baseInit = {
+      ...reqInput ? requestTransportFields(reqInput) : {},
+      ...init ?? {},
+      method
+    };
+    delete baseInit.body;
+    const effectiveSignal = init && "signal" in init ? init.signal ?? void 0 : reqInput?.signal ?? void 0;
+    let bufferedBody;
+    if (init && "body" in init) {
+      bufferedBody = await bufferBody(
+        init.body ?? void 0,
+        effectiveSignal,
+        maxReplayBodyBytes
+      );
+    } else if (reqInput && reqInput.body !== null) {
+      bufferedBody = await readStreamWithSignal(
+        reqInput.clone().body,
+        effectiveSignal,
+        maxReplayBodyBytes
+      );
+    }
+    const buildHeaders = (proof) => {
+      const headers = new Headers(reqInput?.headers ?? void 0);
+      if (init?.headers) {
+        new Headers(init.headers).forEach((v, k) => {
+          headers.set(k, v);
+        });
+      }
+      headers.set("authorization", `DPoP ${accessToken}`);
+      headers.set("dpop", proof);
+      return headers;
+    };
+    const doFetch = async (nonce) => {
+      const proof = await resourceDpopProof(dpopKeyPair, method, url, accessToken, nonce);
+      const req = {
+        ...baseInit,
+        headers: buildHeaders(proof),
+        ...bufferedBody !== void 0 ? { body: bufferedBody } : {}
+      };
+      return userFetch(url, req);
+    };
+    const res = await doFetch();
+    if (res.status === 401) {
+      const serverNonce = res.headers.get("dpop-nonce");
+      if (serverNonce) {
+        await res.body?.cancel().catch(() => {
+        });
+        return doFetch(serverNonce);
+      }
+    }
+    return res;
+  };
+}
+
+// src/identity.ts
+import * as oidc from "openid-client";
+var DEFAULT_SCOPE2 = "openid webid offline_access";
+function normalizeScope(scope) {
+  if (scope === void 0 || scope.trim() === "") {
+    return DEFAULT_SCOPE2;
+  }
+  const parts = scope.split(/\s+/).filter((s) => s.length > 0);
+  if (!parts.includes("openid")) {
+    parts.unshift("openid");
+  }
+  return [...new Set(parts)].join(" ");
+}
+function resolveIdentity(opts) {
+  if (opts.client !== void 0 && opts.clientId !== void 0) {
+    throw new Error(
+      "createSolidOidcClient: supply EITHER `clientId` (a Client ID Document URL) OR `client`, not both."
+    );
+  }
+  if (opts.client !== void 0) {
+    return opts.client;
+  }
+  if (opts.clientId !== void 0) {
+    let u;
+    try {
+      u = new URL(opts.clientId);
+    } catch {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an absolute https: Client Identifier Document URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
+      );
+    }
+    if (u.protocol !== "https:") {
+      throw new Error(
+        `createSolidOidcClient: \`clientId\` shorthand must be an https: URL (got "${opts.clientId}"). For an opaque/static client id, use the \`client\` option.`
+      );
+    }
+    return { clientId: opts.clientId };
+  }
+  throw new Error(
+    "createSolidOidcClient: a client identity is required \u2014 pass `clientId` (a Client ID Document URL, the primary path) or a full `client`."
+  );
+}
+function hasSecret(id) {
+  return "clientSecret" in id && typeof id.clientSecret === "string" && id.clientSecret.length > 0;
+}
+function selectClientAuth(identity, tokenEndpointAuthMethod) {
+  if (!hasSecret(identity)) {
+    if (tokenEndpointAuthMethod !== void 0 && tokenEndpointAuthMethod !== "none") {
+      throw new Error(
+        `createSolidOidcClient: token_endpoint_auth_method "${tokenEndpointAuthMethod}" is not supported for a public client (no \`clientSecret\`). A public client must use \`none\`; private_key_jwt / tls_client_auth (which need a key/cert) are not implemented.`
+      );
+    }
+    return oidc.None();
+  }
+  const secret = identity.clientSecret;
+  switch (tokenEndpointAuthMethod) {
+    case void 0:
+    // default for a confidential client
+    case "client_secret_post":
+      return oidc.ClientSecretPost(secret);
+    case "client_secret_basic":
+      return oidc.ClientSecretBasic(secret);
+    case "client_secret_jwt":
+      return oidc.ClientSecretJwt(secret);
+    case "none":
+      return oidc.None();
+    default:
+      throw new Error(
+        `createSolidOidcClient: unsupported token_endpoint_auth_method "${tokenEndpointAuthMethod}". Supported: client_secret_post (default), client_secret_basic, client_secret_jwt, none.`
+      );
+  }
 }
 
 // src/webid.ts
@@ -445,73 +517,13 @@ async function createSolidOidcClient(opts) {
   const dpopHandle = oidc2.getDPoPHandle(config, toCryptoKeyPair(dpopKeyPair));
   let currentTokens;
   let currentWebId;
-  const authedFetch2 = async (input, init) => {
-    if (currentTokens === void 0) {
-      throw new Error(
-        "authedFetch: no access token yet \u2014 call handleCallback()/refresh() before fetching."
-      );
-    }
-    const accessToken = currentTokens.accessToken;
-    const reqInput = input instanceof Request ? input : void 0;
-    const url = input instanceof Request ? input.url : resolveUrl(input);
-    assertSecureTransport(
-      url,
-      allowInsecure,
-      (msg) => new Error(`authedFetch: ${msg} \u2014 refusing to send the DPoP token over plaintext.`)
-    );
-    const method = (init?.method ?? reqInput?.method ?? "GET").toUpperCase();
-    const baseInit = {
-      ...reqInput ? requestTransportFields(reqInput) : {},
-      ...init ?? {},
-      method
-    };
-    delete baseInit.body;
-    const effectiveSignal = init && "signal" in init ? init.signal ?? void 0 : reqInput?.signal ?? void 0;
-    let bufferedBody;
-    if (init && "body" in init) {
-      bufferedBody = await bufferBody(
-        init.body ?? void 0,
-        effectiveSignal,
-        maxReplayBodyBytes
-      );
-    } else if (reqInput && reqInput.body !== null) {
-      bufferedBody = await readStreamWithSignal(
-        reqInput.clone().body,
-        effectiveSignal,
-        maxReplayBodyBytes
-      );
-    }
-    const buildHeaders = (proof) => {
-      const headers = new Headers(reqInput?.headers ?? void 0);
-      if (init?.headers) {
-        new Headers(init.headers).forEach((v, k) => {
-          headers.set(k, v);
-        });
-      }
-      headers.set("authorization", `DPoP ${accessToken}`);
-      headers.set("dpop", proof);
-      return headers;
-    };
-    const doFetch = async (nonce) => {
-      const proof = await resourceDpopProof(dpopKeyPair, method, url, accessToken, nonce);
-      const req = {
-        ...baseInit,
-        headers: buildHeaders(proof),
-        ...bufferedBody !== void 0 ? { body: bufferedBody } : {}
-      };
-      return userFetch(url, req);
-    };
-    const res = await doFetch();
-    if (res.status === 401) {
-      const serverNonce = res.headers.get("dpop-nonce");
-      if (serverNonce) {
-        await res.body?.cancel().catch(() => {
-        });
-        return doFetch(serverNonce);
-      }
-    }
-    return res;
-  };
+  const authedFetch2 = createAuthedFetch({
+    getAccessToken: () => currentTokens?.accessToken,
+    dpopKeyPair,
+    allowInsecure,
+    maxReplayBodyBytes,
+    userFetch
+  });
   return {
     issuer: opts.issuer,
     dpopKeyPair,
