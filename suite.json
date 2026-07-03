@@ -18,9 +18,22 @@
     "lint": "@biomejs/biome ^2.x",
     "node": ">=20"
   },
-  "dependsOn": ["solid-dpop"],
+  "dependsOn": [
+    "solid-dpop"
+  ],
   "consolidates": [],
   "federation": {
     "membershipTodo": "SDK (not an app). createSolidOidcClient() wraps panva's openid-client v6 to perform the Solid-OIDC authorization-code + PKCE + DPoP flow for server-side Node apps (CLIs, services, bots, agents): issuer discovery, code exchange, token refresh, and a DPoP-attaching authed fetch. Composes @jeswr/solid-dpop for the RFC 9449 proofs (key generation + the resource-leg ath-bound proof) and openid-client's getDPoPHandle for the token-endpoint proofs — reimplements neither DPoP nor OIDC. Primary client path is a Client Identifier Document public client; dynamic client registration is a documented secondary seam. It is a login SDK, not a federation member; it holds no federation membership of its own."
+  },
+  "status": {
+    "generatedAt": "2026-07-03T05:14:38.030Z",
+    "commit": "e3d9eab7c98d87d0685d8d592fed93be80da07a2",
+    "version": "0.1.0",
+    "gate": {
+      "lint": "skip",
+      "typecheck": "skip",
+      "test": "skip",
+      "build": "skip"
+    }
   }
 }
