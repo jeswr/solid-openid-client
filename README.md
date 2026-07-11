@@ -1,3 +1,9 @@
+<!-- mirror-banner -->
+> **Read-only mirror.** `@jeswr/solid-openid-client` is developed in the
+> [jeswr/solid-sdk](https://github.com/jeswr/solid-sdk) monorepo and published here by
+> `scripts/mirror-publish.mjs` so `github:`-pinned installs keep working — do not edit
+> or PR this repo. File issues on the monorepo.
+
 # @jeswr/solid-openid-client
 
 > ⚠️ **Experimental — AI-agent-generated.** Created by an AI coding agent (Claude Opus 4.8, @jeswr's

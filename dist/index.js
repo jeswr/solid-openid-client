@@ -1,10 +1,10 @@
 // src/client.ts
 import * as oidc from "openid-client";
 
-// node_modules/@jeswr/solid-dpop/dist/esm/authCode.js
+// ../solid-dpop/dist/esm/authCode.js
 import { createHash as createHash2, randomBytes, randomUUID as randomUUID2 } from "node:crypto";
 
-// node_modules/@jeswr/solid-dpop/dist/esm/dpop.js
+// ../solid-dpop/dist/esm/dpop.js
 import { createHash, randomUUID } from "node:crypto";
 var josePromise;
 function loadJose() {
